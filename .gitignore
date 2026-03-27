@@ -27,7 +27,7 @@ MemoryCaptures/
 *.mdb
 *.opendb
 *.VC.db
-
+*.idea/
 # =========================
 # OS files
 # =========================

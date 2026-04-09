@@ -3,6 +3,29 @@ import numpy as np
 import pygame
 import os
 
+import socket  # NUEVO: Para la comunicación UDP
+import json    # NUEVO: Para estructurar los mensajes
+
+# --- CONFIGURACIÓN UDP ---
+UDP_IP = "127.0.0.1"  # Localhost (asumiendo que Pygame corre en la misma PC)
+UDP_PORT = 5005       # Un puerto libre cualquiera
+# Crear el socket UDP
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# Función auxiliar para encontrar el centro (X, Y) del color principal en pantalla
+def obtener_centro_global(mask):
+    contornos, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contornos:
+        # Quedarnos con la mancha de color más grande
+        c_max = max(contornos, key=cv2.contourArea)
+        if cv2.contourArea(c_max) > 500: # Ignorar manchas muy pequeñas
+            M = cv2.moments(c_max)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                return [cx, cy] # Usamos lista para que sea compatible con JSON
+    return None # Si no detecta nada
+
 # --- Optimizar latencia de sonido (Buffer más pequeño) ---
 pygame.mixer.pre_init(44100, -16, 2, 512) # Ajusta frecuencias y baja el buffer a 512
 
@@ -379,10 +402,7 @@ while True:
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         # Permite salir del programa sin necesidad de completar
-        cap.release()
-        cv2.destroyAllWindows()
-        pygame.quit()
-        exit()
+        break
 
 
 # Bucle de ubicación de elementos
@@ -504,10 +524,21 @@ while indice_elemento < len(elementos_a_ubicar):
     cv2.imshow('Deteccion de Bateria', frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
-        cap.release()
-        cv2.destroyAllWindows()
-        pygame.quit()
-        exit()
+        pads_game = {
+            # Platillos y Charles (Arco superior)
+            (0, 0): (170, 70, 110, 60),  # Platillo Crash 1 (círculo grande)
+            (0, 1): (400, 70, 90, 50),  # Tom Alto 1
+            
+            # Toms y Caja (Arco central-inferior)
+            (1, 0): (190, 200, 110, 30),  # Hi-Hat
+            (1, 1): (320, 240, 140, 50),  # Caja (Snare)
+            (1, 2): (480, 240, 140, 50),  # Tom inferior
+            
+            # Base
+            (2, 1): (400, 450, 110, 30),  # Bombo 
+        }
+
+        break
 
 # == Preparar variables para el Bucle Jugable Final ==
 # Esto sobreescribe los 'ovales' estáticos iniciales en favor de los que el usuario construyó.
@@ -530,7 +561,14 @@ for celda, (cx, cy, ancho, alto) in pads_game.items():
 estado_red = {celda: False for celda in ovales}
 estado_verde = {celda: False for celda in ovales}
 
-
+mapa_teclas = {
+    ord('1'): (0, 0), # Platillo Crash 1
+    ord('2'): (0, 1), # Tom Alto 1
+    ord('3'): (1, 0), # Hi-Hat
+    ord('4'): (1, 1), # Caja (Snare)
+    ord('5'): (2, 1), # Bombo
+    ord('6'): (2, 2) # Tom de Piso (Floor Tom)
+}
 #Bucle jugable
 while True:
     ret, frame = cap.read()
@@ -550,9 +588,27 @@ while True:
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
 
-        # Recorrer cada cuadrado
+    # =================================================================
+    # NUEVO: ENVÍO CONSTANTE DE POSICIONES
+    # =================================================================
+    centro_rosa = obtener_centro_global(mask_red)
+    centro_verde = obtener_centro_global(mask_green)
+
+    mensaje_posiciones = {
+        "tipo": "posicion",
+        "stick_1_x": centro_rosa[0] if centro_rosa else None,
+        "stick_1_y": centro_rosa[1] if centro_rosa else None,
+        "stick_2_x": centro_verde[0] if centro_verde else None,
+        "stick_2_y": centro_verde[1] if centro_verde else None,
+    }
+
+    # Enviar a Pygame
+    sock.sendto(json.dumps(mensaje_posiciones).encode('utf-8'), (UDP_IP, UDP_PORT))
+    # =================================================================
+
+    # Recorrer cada cuadrado
     for celda, (cx, cy, ancho, alto, x1, y1, x2, y2) in ovales.items():
-        # 1. Ajustar límites para evitar índices negativos o fuera de pantalla (suponiendo 640x480)
+        # 1. Ajustar límites para evitar índices negativos o fuera de pantalla
         x1_safe = max(0, x1)
         y1_safe = max(0, y1)
         x2_safe = min(640, x2)
@@ -570,14 +626,14 @@ while True:
         
         mask_oval_safe = mascaras_roi[celda][my1:my2, mx1:mx2]
         
-        # Superponer la máscara en forma de óvalo para ignorar las esquinas de manera segura
+        # Superponer la máscara en forma de óvalo para ignorar las esquinas
         roi_red = cv2.bitwise_and(roi_red_rect, mask_oval_safe)
         roi_green = cv2.bitwise_and(roi_green_rect, mask_oval_safe)
         
-        # Usaremos el área de la máscara recortada, para que sea un cálculo fiel
+        # Usaremos el área de la máscara recortada
         area_total = cv2.countNonZero(mask_oval_safe)
         if area_total == 0: 
-            continue # Evitar divisiones por cero si la figura está completamente fuera
+            continue 
 
         porcentaje_red = cv2.countNonZero(roi_red) / area_total
         porcentaje_green = cv2.countNonZero(roi_green) / area_total
@@ -586,7 +642,16 @@ while True:
         if porcentaje_red > 0.005:
             if not estado_red[celda]:
                 estado_red[celda] = True
-                if sonidos[celda]: sonidos[celda].play()
+                if sonidos[celda]: 
+                    sonidos[celda].play()
+                
+                # NUEVO: ENVIAR EVENTO DE GOLPE (ROSA)
+                mensaje_golpe = {
+                    "tipo": "golpe",
+                    "pad": str(celda) # Convertimos la tupla (0,1) a string "(0, 1)" para JSON
+                }
+                sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
+
         elif porcentaje_red < 0.005:
             estado_red[celda] = False
 
@@ -594,9 +659,20 @@ while True:
         if porcentaje_green > 0.005:
             if not estado_verde[celda]:
                 estado_verde[celda] = True
-                if sonidos[celda]: sonidos[celda].play()
+                if sonidos[celda]: 
+                    sonidos[celda].play()
+                
+                # NUEVO: ENVIAR EVENTO DE GOLPE (VERDE)
+                mensaje_golpe = {
+                    "tipo": "golpe",
+                    "pad": str(celda)
+                }
+                sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
+
         elif porcentaje_green < 0.005:
             estado_verde[celda] = False
+
+        
 
         # --- Determinar color de interfaz ---
         if estado_red[celda] and estado_verde[celda]:
@@ -628,8 +704,29 @@ while True:
     cv2.imshow('Deteccion de Bateria', frame)
     cv2.imshow('Mascara Combinada (IA)', mask_combinada)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    tecla = cv2.waitKey(1) & 0xFF
+
+    if tecla == ord('q'):
+        break  # Salir del programa
+        
+    # Si la tecla presionada está en nuestro mapa (es decir, es del 1 al 6)
+    elif tecla in mapa_teclas:
+        celda_manual = mapa_teclas[tecla]
+        
+        # 1. Reproducir el sonido localmente
+        if celda_manual in sonidos and sonidos[celda_manual]:
+            sonidos[celda_manual].play()
+            
+        # 2. Enviar el evento por UDP al servicio de Pygame
+        mensaje_golpe = {
+            "tipo": "golpe",
+            "pad": str(celda_manual),
+            "color": "teclado" # Un identificador útil para saber que fue manual
+        }
+        sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
+        
+        # Un pequeño aviso en consola para que sepas que funcionó
+        print(f"Prueba manual: Pad {celda_manual} activado con el teclado.")
 
 cap.release()
 cv2.destroyAllWindows()

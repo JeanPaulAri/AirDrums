@@ -10,21 +10,26 @@ UNITY_HOST = "127.0.0.1"
 UNITY_PORT = 5052
 BUFFER_SIZE = 65535
 
+STICK_1_LABEL = 1
+STICK_2_LABEL = 2
 
-ZONE_ALIASES = {
-    "tarola": "snare",
-    "hithat": "hihat",
-    "platillo": "crash",
-    "tom": "tom",
-    "tom_grave": "floor_tom",
-    "bombo": "kick",
+PAD_CODE_TO_ZONE = {
+    "(0,0)": "platillo",
+    "(0,1)": "tom superior",
+    "(1,0)": "hithat",
+    "(1,1)": "tarola",
+    "(2,1)": "bombo",
+    "(2,2)": "tom inferior",
 }
 
 
 class AirDrumsMiddleware:
+    # Inicializa sockets, estado compartido y estructuras necesarias para procesar mensajes en tiempo real.
     def __init__(self):
         self.drum_zones = {}
-        self.zones_lock = threading.Lock()
+        self.frame_size = {"dim_x": None, "dim_y": None}
+        self.last_positions = {}
+        self.state_lock = threading.Lock()
         self.running = False
         self.listener_thread = None
 
@@ -33,6 +38,7 @@ class AirDrumsMiddleware:
 
         self.unity_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+    # Inicia el hilo de escucha para recibir mensajes sin bloquear la ejecucion principal.
     def start(self):
         if self.running:
             return
@@ -41,10 +47,11 @@ class AirDrumsMiddleware:
         self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listener_thread.start()
         print(
-            "[INFO] Middleware activo. Escuchando OpenCV en UDP "
+            "[INFO] Middleware activo. Escuchando AirDrums en UDP "
             f"{LISTEN_HOST}:{LISTEN_PORT} y reenviando a Unity en {UNITY_HOST}:{UNITY_PORT}"
         )
 
+    # Detiene el middleware y cierra los sockets abiertos.
     def stop(self):
         self.running = False
 
@@ -58,6 +65,7 @@ class AirDrumsMiddleware:
         except OSError:
             pass
 
+    # Espera paquetes UDP y captura el timestamp justo al momento de recibirlos.
     def _listen_loop(self):
         while self.running:
             try:
@@ -68,6 +76,7 @@ class AirDrumsMiddleware:
 
             self._handle_packet(data, address, received_at)
 
+    # Decodifica el JSON y envia cada mensaje al manejador que corresponda.
     def _handle_packet(self, data, address, received_at):
         try:
             message = json.loads(data.decode("utf-8"))
@@ -75,61 +84,93 @@ class AirDrumsMiddleware:
             print(f"[WARN] Paquete invalido desde {address}: {error}")
             return
 
-        message_type = message.get("type")
+        message_type = message.get("tipo")
 
-        if message_type == "calibration":
-            self._handle_calibration(message)
+        if message_type == "configuracion":
+            self._handle_configuration(message)
             return
 
-        if message_type == "hit":
+        if message_type == "posicion":
+            self._handle_position(message)
+            return
+
+        if message_type == "golpe":
             self._handle_hit(message, received_at)
             return
 
         print(f"[WARN] Tipo de mensaje desconocido: {message_type}")
 
-    def _handle_calibration(self, message):
-        zones = self._parse_calibration(message)
+    # Guarda la configuracion inicial de la bateria enviada desde el sistema de vision.
+    def _handle_configuration(self, message):
+        zones = self._parse_configuration(message)
         if not zones:
-            print("[WARN] Calibration recibida, pero no se pudieron extraer zonas validas")
+            print("[WARN] Configuracion recibida, pero no se pudieron extraer zonas validas")
             return
 
-        with self.zones_lock:
+        with self.state_lock:
             self.drum_zones = zones
+            self.frame_size["dim_x"] = message.get("dim_x")
+            self.frame_size["dim_y"] = message.get("dim_y")
 
-        print(f"[INFO] Calibration cargada con zonas: {', '.join(zones.keys())}")
+        unity_payload = {
+            "tipo": "configuracion",
+            "dim_x": message.get("dim_x"),
+            "dim_y": message.get("dim_y"),
+            "elementos": list(zones.values()),
+        }
+        self._send_to_unity(unity_payload)
+        print(f"[INFO] Configuracion cargada con zonas: {', '.join(zones.keys())}")
 
+    # Actualiza la ultima posicion conocida de ambas baquetas para inferir quien golpeo.
+    def _handle_position(self, message):
+        positions = {
+            STICK_1_LABEL: {
+                "x": message.get("stick_1_x"),
+                "y": message.get("stick_1_y"),
+            },
+            STICK_2_LABEL: {
+                "x": message.get("stick_2_x"),
+                "y": message.get("stick_2_y"),
+            },
+        }
+
+        with self.state_lock:
+            self.last_positions = positions
+
+        unity_payload = {
+            "tipo": "posicion",
+            "stick_1_x": message.get("stick_1_x"),
+            "stick_1_y": message.get("stick_1_y"),
+            "stick_2_x": message.get("stick_2_x"),
+            "stick_2_y": message.get("stick_2_y"),
+        }
+        self._send_to_unity(unity_payload)
+
+    # Convierte un golpe del sistema de vision en el mensaje final que Unity necesita.
     def _handle_hit(self, message, received_at):
-        if not message.get("hit"):
-            return
-
-        with self.zones_lock:
+        with self.state_lock:
             zones_ready = bool(self.drum_zones)
             current_zones = dict(self.drum_zones)
+            current_positions = dict(self.last_positions)
 
         if not zones_ready:
-            print("[WARN] Hit ignorado porque aun no hay calibration")
+            print("[WARN] Golpe ignorado porque aun no hay configuracion")
             return
 
-        source = message.get("source")
-        x = message.get("x")
-        y = message.get("y")
-
-        if source == "kick_pedal":
-            zone = "kick"
-            stick = "foot"
-        elif source == "stick_right":
-            zone = self._detect_zone(current_zones, x, y)
-            stick = "right"
-        elif source == "stick_left":
-            zone = self._detect_zone(current_zones, x, y)
-            stick = "left"
-        else:
-            print(f"[WARN] Fuente de hit desconocida: {source}")
-            return
+        pad_code = self._normalize_pad_code(message.get("pad"))
+        zone = PAD_CODE_TO_ZONE.get(pad_code)
 
         if zone is None:
-            print(f"[WARN] No se encontro zona para hit en ({x}, {y}) desde {source}")
+            print(f"[WARN] Pad desconocido en golpe: {message.get('pad')}")
             return
+
+        if zone == "bombo":
+            stick = 3
+        else:
+            stick = self._resolve_stick_for_zone(zone, current_zones, current_positions)
+            if stick is None:
+                print(f"[WARN] No se pudo inferir la baqueta para la zona {zone}")
+                return
 
         payload = {
             "zone": zone,
@@ -138,6 +179,72 @@ class AirDrumsMiddleware:
         }
         self._send_to_unity(payload)
 
+    # Convierte la lista de elementos calibrados en un diccionario simple de zonas y coordenadas.
+    def _parse_configuration(self, message):
+        elements = message.get("elementos")
+        normalized = {}
+
+        if not isinstance(elements, list):
+            return normalized
+
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+
+            pad_code = self._normalize_pad_code(element.get("elemento"))
+            zone = PAD_CODE_TO_ZONE.get(pad_code)
+            if zone is None:
+                continue
+
+            x = element.get("x")
+            y = element.get("y")
+            if x is None or y is None:
+                continue
+
+            normalized[zone] = {
+                "zone": zone,
+                "pad": pad_code,
+                "x": x,
+                "y": y,
+            }
+
+        return normalized
+
+    # Limpia el formato de las tuplas para aceptar espacios como "(1, 2)" o "(1,2)".
+    def _normalize_pad_code(self, raw_code):
+        if raw_code is None:
+            return None
+
+        return str(raw_code).strip().replace(" ", "")
+
+    # Decide que baqueta estuvo mas cerca del pad golpeado usando la ultima posicion recibida.
+    def _resolve_stick_for_zone(self, zone, zones, positions):
+        zone_info = zones.get(zone)
+        if zone_info is None:
+            return None
+
+        zone_x = zone_info.get("x")
+        zone_y = zone_info.get("y")
+        if zone_x is None or zone_y is None:
+            return None
+
+        best_stick = None
+        best_distance = None
+
+        for stick_name, stick_position in positions.items():
+            stick_x = stick_position.get("x")
+            stick_y = stick_position.get("y")
+            if stick_x is None or stick_y is None:
+                continue
+
+            distance = self._distance_squared(zone_x, zone_y, stick_x, stick_y)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_stick = stick_name
+
+        return best_stick
+
+    # Reenvia a Unity el mensaje que corresponda, ya sea visualizacion o evento de juego.
     def _send_to_unity(self, payload):
         try:
             encoded = json.dumps(payload).encode("utf-8")
@@ -146,160 +253,14 @@ class AirDrumsMiddleware:
         except OSError as error:
             print(f"[WARN] No se pudo enviar a Unity: {error}")
 
-    def _parse_calibration(self, message):
-        raw_zones = (
-            message.get("zones")
-            or message.get("drum_zones")
-            or message.get("calibration")
-            or message.get("data")
-        )
-        normalized = {}
-
-        if isinstance(raw_zones, dict):
-            for zone_name, zone_data in raw_zones.items():
-                zone = self._normalize_zone(zone_name, zone_data)
-                if zone is not None:
-                    normalized[zone["name"]] = zone
-        elif isinstance(raw_zones, list):
-            for zone_data in raw_zones:
-                zone = self._normalize_zone(None, zone_data)
-                if zone is not None:
-                    normalized[zone["name"]] = zone
-
-        return normalized
-
-    def _normalize_zone(self, fallback_name, zone_data):
-        if not isinstance(zone_data, dict):
-            return None
-
-        raw_name = (
-            zone_data.get("name")
-            or zone_data.get("zone")
-            or zone_data.get("label")
-            or fallback_name
-        )
-        name = self._canonical_zone_name(raw_name)
-        if name is None:
-            return None
-
-        if "center" in zone_data and isinstance(zone_data["center"], (list, tuple)) and len(zone_data["center"]) >= 2:
-            center_x = zone_data["center"][0]
-            center_y = zone_data["center"][1]
-            if "radius" in zone_data:
-                return {
-                    "name": name,
-                    "shape": "circle",
-                    "x": center_x,
-                    "y": center_y,
-                    "radius": zone_data["radius"],
-                }
-
-        if "center" in zone_data and isinstance(zone_data["center"], dict):
-            center_x = zone_data["center"].get("x")
-            center_y = zone_data["center"].get("y")
-            if "radius" in zone_data:
-                return {
-                    "name": name,
-                    "shape": "circle",
-                    "x": center_x,
-                    "y": center_y,
-                    "radius": zone_data["radius"],
-                }
-
-        if all(key in zone_data for key in ("x", "y", "radius")):
-            return {
-                "name": name,
-                "shape": "circle",
-                "x": zone_data["x"],
-                "y": zone_data["y"],
-                "radius": zone_data["radius"],
-            }
-
-        if all(key in zone_data for key in ("cx", "cy", "rx", "ry")):
-            return {
-                "name": name,
-                "shape": "ellipse",
-                "cx": zone_data["cx"],
-                "cy": zone_data["cy"],
-                "rx": zone_data["rx"],
-                "ry": zone_data["ry"],
-            }
-
-        if all(key in zone_data for key in ("x", "y", "width", "height")):
-            return {
-                "name": name,
-                "shape": "rect",
-                "x": zone_data["x"],
-                "y": zone_data["y"],
-                "width": zone_data["width"],
-                "height": zone_data["height"],
-            }
-
-        if all(key in zone_data for key in ("left", "top", "right", "bottom")):
-            return {
-                "name": name,
-                "shape": "rect",
-                "x": zone_data["left"],
-                "y": zone_data["top"],
-                "width": zone_data["right"] - zone_data["left"],
-                "height": zone_data["bottom"] - zone_data["top"],
-            }
-
-        print(f"[WARN] Zona '{name}' sin geometria compatible: {zone_data}")
-        return None
-
-    def _canonical_zone_name(self, raw_name):
-        if not raw_name:
-            return None
-
-        cleaned = str(raw_name).strip().lower().replace("-", "_")
-        cleaned = " ".join(cleaned.split())
-        return ZONE_ALIASES.get(cleaned, cleaned.replace(" ", "_"))
-
-    def _detect_zone(self, zones, x, y):
-        if x is None or y is None:
-            return None
-
-        for zone_name, zone in zones.items():
-            if zone_name == "kick":
-                continue
-
-            shape = zone.get("shape")
-
-            if shape == "circle" and self._point_in_circle(x, y, zone):
-                return zone_name
-
-            if shape == "ellipse" and self._point_in_ellipse(x, y, zone):
-                return zone_name
-
-            if shape == "rect" and self._point_in_rect(x, y, zone):
-                return zone_name
-
-        return None
-
-    def _point_in_circle(self, x, y, zone):
-        dx = x - zone["x"]
-        dy = y - zone["y"]
-        radius = zone["radius"]
-        return (dx * dx) + (dy * dy) <= (radius * radius)
-
-    def _point_in_ellipse(self, x, y, zone):
-        rx = zone["rx"]
-        ry = zone["ry"]
-        if rx == 0 or ry == 0:
-            return False
-
-        dx = x - zone["cx"]
-        dy = y - zone["cy"]
-        return ((dx * dx) / (rx * rx)) + ((dy * dy) / (ry * ry)) <= 1
-
-    def _point_in_rect(self, x, y, zone):
-        return (
-            zone["x"] <= x <= zone["x"] + zone["width"]
-            and zone["y"] <= y <= zone["y"] + zone["height"]
-        )
+    # Calcula distancia al cuadrado para comparar cercania sin usar raiz cuadrada.
+    def _distance_squared(self, x1, y1, x2, y2):
+        dx = x1 - x2
+        dy = y1 - y2
+        return (dx * dx) + (dy * dy)
 
 
+# Levanta el middleware y lo mantiene activo hasta que el usuario lo detenga manualmente.
 def main():
     middleware = AirDrumsMiddleware()
     middleware.start()
@@ -314,4 +275,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

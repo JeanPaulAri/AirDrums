@@ -21,6 +21,8 @@ while True:
         elif mensaje["tipo"] == "posicion":
             count += 1
             if count % 60 == 0: print(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')} - {mensaje}")
+        elif mensaje["tipo"] == "configuracion":
+            print(mensaje["elementos"])
             
     except BlockingIOError:
         pass # No hay mensajes nuevos en este fotograma, el juego sigue normal

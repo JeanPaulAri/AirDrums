@@ -540,6 +540,31 @@ while indice_elemento < len(elementos_a_ubicar):
 
         break
 
+lista_elementos = []
+
+# Recorremos lo que el usuario guardó (o los valores por defecto si presionó 'q')
+for celda, datos in pads_game.items():
+    cx, cy, ancho, alto = datos
+    
+    # Creamos el diccionario individual para cada pad
+    pad_data = {
+        "elemento": str(celda), # Usaremos la tupla como texto, ej: "(1, 1)"
+        "x": cx,
+        "y": cy
+    }
+    lista_elementos.append(pad_data)
+
+# Armamos el mensaje final completo
+mensaje_calibracion = {
+    "tipo": "configuracion", # Etiqueta útil para que tu Pygame sepa cómo procesarlo
+    "dim_x": 640,
+    "dim_y": 480,
+    "elementos": lista_elementos
+}
+
+# Enviamos el paquete por UDP
+sock.sendto(json.dumps(mensaje_calibracion).encode('utf-8'), (UDP_IP, UDP_PORT))
+
 # == Preparar variables para el Bucle Jugable Final ==
 # Esto sobreescribe los 'ovales' estáticos iniciales en favor de los que el usuario construyó.
 ovales = {}

@@ -8,7 +8,7 @@ import json    # NUEVO: Para estructurar los mensajes
 
 # --- CONFIGURACIÓN UDP ---
 UDP_IP = "127.0.0.1"  # Localhost (asumiendo que Pygame corre en la misma PC)
-UDP_PORT = 5005       # Un puerto libre cualquiera
+UDP_PORT = 5051       # Un puerto libre cualquiera
 # Crear el socket UDP
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 

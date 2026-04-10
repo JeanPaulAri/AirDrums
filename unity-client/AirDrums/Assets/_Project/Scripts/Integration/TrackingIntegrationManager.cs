@@ -17,8 +17,14 @@ public class TrackingIntegrationManager : MonoBehaviour
     [SerializeField] private bool logParsedHits = true;
     [SerializeField] private bool enable3DStickMotion = true;
 
+    [SerializeField] private bool showDebugOverlay = true;
+    [SerializeField] private float overlayVisibleSeconds = 2f;
+    
+    private Coroutine overlayRoutine;
     private readonly Queue<Action> mainThreadActions = new Queue<Action>();
     private MiddlewareConfigurationMessage currentConfiguration;
+    
+    
 
     private void Awake()
     {
@@ -189,12 +195,20 @@ public class TrackingIntegrationManager : MonoBehaviour
 
         EnqueueMainThreadAction(() =>
         {
-            if (debugOverlay != null)
+            if (debugOverlay != null && debugOverlay.gameObject.activeInHierarchy)
             {
                 debugOverlay.HighlightZone(rawZoneKey);
             }
 
-            if (internalHit.stick == "foot" && footStickVisualizer != null)
+            if (internalHit.stick == "right" && rightStickVisualizer != null)
+            {
+                rightStickVisualizer.PulseHitFeedback();
+            }
+            else if (internalHit.stick == "left" && leftStickVisualizer != null)
+            {
+                leftStickVisualizer.PulseHitFeedback();
+            }
+            else if (internalHit.stick == "foot" && footStickVisualizer != null)
             {
                 footStickVisualizer.PulseHitFeedback();
             }
@@ -216,12 +230,35 @@ public class TrackingIntegrationManager : MonoBehaviour
 
         if (debugOverlay != null)
         {
+            debugOverlay.gameObject.SetActive(showDebugOverlay);
             debugOverlay.SetConfiguration(message);
+
+            if (showDebugOverlay)
+            {
+                if (overlayRoutine != null)
+                {
+                    StopCoroutine(overlayRoutine);
+                }
+
+                overlayRoutine = StartCoroutine(HideOverlayAfterDelay());
+            }
         }
 
         Debug.Log("[TrackingIntegrationManager] Configuración cargada: " +
                   message.dim_x + "x" + message.dim_y +
                   " | elementos=" + message.elementos.Length);
+    }
+
+    private System.Collections.IEnumerator HideOverlayAfterDelay()
+    {
+        yield return new WaitForSeconds(overlayVisibleSeconds);
+
+        if (debugOverlay != null)
+        {
+            debugOverlay.gameObject.SetActive(false);
+        }
+
+        overlayRoutine = null;
     }
 
     private void HandlePositionOnMainThread(MiddlewarePositionMessage message)

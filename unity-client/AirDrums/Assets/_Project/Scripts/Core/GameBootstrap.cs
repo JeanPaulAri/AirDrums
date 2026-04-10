@@ -1,12 +1,9 @@
 using UnityEngine;
 
-namespace AirDrums.Core
+public class GameBootstrap : MonoBehaviour
 {
-    public class GameBootstrap : MonoBehaviour
+    private void Start()
     {
-        private void Awake()
-        {
-            Debug.Log("AirDrums bootstrap initialized.");
-        }
+        Debug.Log("[GameBootstrap] AirDrums iniciado.");
     }
 }

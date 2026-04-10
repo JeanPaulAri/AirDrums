@@ -12,6 +12,8 @@ BUFFER_SIZE = 65535
 
 STICK_1_LABEL = 1
 STICK_2_LABEL = 2
+STICK_3_LABEL = 3
+
 
 PAD_CODE_TO_ZONE = {
     "(0,0)": "platillo",
@@ -132,6 +134,10 @@ class AirDrumsMiddleware:
                 "x": message.get("stick_2_x"),
                 "y": message.get("stick_2_y"),
             },
+            STICK_3_LABEL: {
+                "x": message.get("stick_3_x"),
+                "y": message.get("stick_3_y"),
+            },
         }
 
         with self.state_lock:
@@ -143,6 +149,8 @@ class AirDrumsMiddleware:
             "stick_1_y": message.get("stick_1_y"),
             "stick_2_x": message.get("stick_2_x"),
             "stick_2_y": message.get("stick_2_y"),
+            "stick_3_x": message.get("stick_3_x"),
+            "stick_3_y": message.get("stick_3_y"),
         }
         self._send_to_unity(unity_payload)
 
@@ -231,7 +239,8 @@ class AirDrumsMiddleware:
         best_stick = None
         best_distance = None
 
-        for stick_name, stick_position in positions.items():
+        for stick_name in (STICK_1_LABEL, STICK_2_LABEL):
+            stick_position = positions.get(stick_name, {})
             stick_x = stick_position.get("x")
             stick_y = stick_position.get("y")
             if stick_x is None or stick_y is None:

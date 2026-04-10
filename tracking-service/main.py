@@ -604,20 +604,45 @@ while True:
     frame = cv2.flip(frame, 1)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # 1. Crear máscaras para Rosa y Verde
+    # 1. Crear máscaras (Asumimos que configuraste lower_blue y upper_blue para tu pie)
     mask_red = cv2.inRange(hsv, lower_red, upper_red)
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
+    mask_pie = cv2.inRange(hsv, lower_red, upper_red) # NUEVO COLOR PARA EL PIE
     
-    # Filtro morfológico para limpiar ruidos de la cámara
+    # Filtro morfológico
     kernel = np.ones((5,5), np.uint8)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
+    mask_pie = cv2.morphologyEx(mask_pie, cv2.MORPH_OPEN, kernel)
 
     # =================================================================
-    # NUEVO: ENVÍO CONSTANTE DE POSICIONES
+    # NUEVO: DIVISIÓN DE PANTALLA EN Y = 360
     # =================================================================
-    centro_rosa = obtener_centro_global(mask_red)
-    centro_verde = obtener_centro_global(mask_green)
+    # mask[y_inicio : y_fin, x_inicio : x_fin] = 0 (0 es color negro)
+
+    mask_left = mask_red.copy()
+    mask_right = mask_green.copy()
+    # Para las manos (Rojo y Verde): Apagamos todo desde y=360 hasta abajo
+    mask_left[360:, :] = 0
+    mask_right[360:, :] = 0
+
+    # Para el pie (Tercer color): Apagamos todo desde arriba hasta y=360
+    mask_pie[:360, :] = 0
+
+    # Opcional: Dibujar una línea en la pantalla para que tú veas el límite físico
+    cv2.line(frame, (0, 360), (640, 360), (255, 255, 255), 2)
+    cv2.putText(frame, "ZONA DE MANOS", (10, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    cv2.putText(frame, "ZONA DE PIE", (10, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+
+    # =================================================================
+
+    # =================================================================
+    # ENVÍO CONSTANTE DE POSICIONES
+    # =================================================================
+    centro_rosa = obtener_centro_global(mask_left)
+    centro_verde = obtener_centro_global(mask_right)
+    centro_pie = obtener_centro_global(mask_pie) # Calculamos el tercer centro
 
     mensaje_posiciones = {
         "tipo": "posicion",
@@ -625,10 +650,33 @@ while True:
         "stick_1_y": centro_rosa[1] if centro_rosa else None,
         "stick_2_x": centro_verde[0] if centro_verde else None,
         "stick_2_y": centro_verde[1] if centro_verde else None,
+        "stick_3_x": centro_pie[0] if centro_pie else None, # Nuevo campo para el pie
+        "stick_3_y": centro_pie[1] if centro_pie else None
     }
 
     # Enviar a Pygame
     sock.sendto(json.dumps(mensaje_posiciones).encode('utf-8'), (UDP_IP, UDP_PORT))
+    # =================================================================
+
+    # =================================================================
+    # NUEVO: DIBUJAR UNA "X" EN LOS CENTROS DETECTADOS
+    # =================================================================
+    # cv2.drawMarker(imagen, (x, y), color_bgr, tipo_marcador, tamaño, grosor)
+    
+    if centro_rosa:
+        # Dibuja una 'X' color Magenta
+        cv2.drawMarker(frame, (centro_rosa[0], centro_rosa[1]), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 3)
+        cv2.putText(frame, "Mano R", (centro_rosa[0] + 10, centro_rosa[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+        
+    if centro_verde:
+        # Dibuja una 'X' color Verde
+        cv2.drawMarker(frame, (centro_verde[0], centro_verde[1]), (0, 255, 0), cv2.MARKER_TILTED_CROSS, 20, 3)
+        cv2.putText(frame, "Mano V", (centro_verde[0] + 10, centro_verde[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    if centro_pie:
+        # Dibuja una 'X' color Azul
+        cv2.drawMarker(frame, (centro_pie[0], centro_pie[1]), (255, 0, 0), cv2.MARKER_TILTED_CROSS, 20, 3)
+        cv2.putText(frame, "Pie", (centro_pie[0] + 10, centro_pie[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
     # =================================================================
 
     # Recorrer cada cuadrado

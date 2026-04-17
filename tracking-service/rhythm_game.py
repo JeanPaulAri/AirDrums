@@ -37,8 +37,8 @@ HIGHWAY_FILL = (32, 25, 24)
 HUD_TEXT = (241, 232, 208)
 MISS_TEXT = (255, 117, 117)
 # Ventanas de timing y arranque.
-EARLY_HIT_WINDOW_SECONDS = 0.035
-LATE_HIT_WINDOW_SECONDS = 0.20
+EARLY_HIT_WINDOW_SECONDS = 0.120
+LATE_HIT_WINDOW_SECONDS = 0.120
 PREVIEW_LEAD_SECONDS = 3.35
 START_DELAY_SECONDS = 1.5
 # Filtros para reducir densidad en charts de batería.
@@ -50,6 +50,8 @@ DRUM_MAX_NOTES_PER_SECOND = 4
 # Curva de viaje de notas (sensación de velocidad en pantalla).
 NOTE_TRAVEL_CURVE = 1.45
 ADAPT_CLUSTER_WINDOW_SECONDS = 0.15
+
+GLOBAL_OFFSET_SECONDS = 0
 
 # Colores de los carriles (platillo -> tom inferior).
 LANE_COLORS = [
@@ -731,6 +733,8 @@ class MidiTempoConverter:
 class RhythmGame:
     """Loop principal del juego: input, lógica, dibujo y audio."""
     def __init__(self):
+        # Pre-inicializar el mixer con un búfer bajo (512) para eliminar el retraso de audio
+        pygame.mixer.pre_init(44100, -16, 2, 512)
         pygame.init()
         pygame.mixer.init()
         pygame.mixer.set_num_channels(8)
@@ -843,7 +847,32 @@ class RhythmGame:
                 pygame.mixer.music.stop()
 
     def _start_song(self):
+        # --- PRECARGAR AUDIO ANTES DE INICIAR EL TIEMPO ---
+        if self.song_data.audio_path is not None:
+            pygame.mixer.music.load(str(self.song_data.audio_path))
+            
+            try:
+                if self.song_data.vocals_path is not None:
+                    self.vocals_sound = pygame.mixer.Sound(str(self.song_data.vocals_path))
+            except Exception:
+                self.vocals_sound = None
+
+            try:
+                if self.song_data.rhythm_path is not None:
+                    self.rhythm_sound = pygame.mixer.Sound(str(self.song_data.rhythm_path))
+            except Exception:
+                self.rhythm_sound = None
+
+            self.drums_sounds = []
+            for drum_path in self.song_data.drums_paths[:4]:
+                try:
+                    self.drums_sounds.append(pygame.mixer.Sound(str(drum_path)))
+                except Exception:
+                    continue
+        # --------------------------------------------------
+
         self.state = "playing"
+        # ¡IMPORTANTE! El tiempo se calcula ahora DESPUÉS de cargar la memoria
         self.song_started_at = (pygame.time.get_ticks() / 1000.0) + START_DELAY_SECONDS
         self.music_started = False
         self.score = 0
@@ -897,33 +926,18 @@ class RhythmGame:
             return
 
         try:
-            pygame.mixer.music.load(str(self.song_data.audio_path))
             pygame.mixer.music.play()
-            # Load and play optional stems (lazy) on dedicated channels to keep selection fast
-            try:
-                if self.song_data.vocals_path is not None:
-                    self.vocals_sound = pygame.mixer.Sound(str(self.song_data.vocals_path))
-                    self.vocals_channel.play(self.vocals_sound)
-            except Exception:
-                self.vocals_sound = None
-
-            try:
-                if self.song_data.rhythm_path is not None:
-                    self.rhythm_sound = pygame.mixer.Sound(str(self.song_data.rhythm_path))
-                    self.rhythm_channel.play(self.rhythm_sound)
-            except Exception:
-                self.rhythm_sound = None
-
-            # Optional drum stems (drums_1..drums_4)
-            self.drums_sounds = []
-            for index, drum_path in enumerate(self.song_data.drums_paths[:4]):
-                try:
-                    sound = pygame.mixer.Sound(str(drum_path))
-                    self.drums_sounds.append(sound)
-                    if index < len(self.drums_channels):
-                        self.drums_channels[index].play(sound)
-                except Exception:
-                    continue
+            
+            if self.vocals_sound is not None:
+                self.vocals_channel.play(self.vocals_sound)
+                
+            if self.rhythm_sound is not None:
+                self.rhythm_channel.play(self.rhythm_sound)
+                
+            for index, sound in enumerate(self.drums_sounds):
+                if index < len(self.drums_channels):
+                    self.drums_channels[index].play(sound)
+                    
         except pygame.error:
             pass
 
@@ -935,7 +949,7 @@ class RhythmGame:
             return
 
         current_time = pygame.time.get_ticks() / 1000.0
-        song_time = current_time - self.song_started_at
+        song_time = current_time - self.song_started_at - GLOBAL_OFFSET_SECONDS
 
         candidate = None
         candidate_offset = None
@@ -964,7 +978,8 @@ class RhythmGame:
         self.combo += 1
         self.best_combo = max(self.best_combo, self.combo)
         self.score += max(50, int(150 - (abs(candidate_offset) * 500)))
-        self.last_judgement = "Perfecto" if abs(candidate_offset) < 0.055 else "Bien"
+        # Ampliamos la ventana de Perfecto de 55ms a 65ms
+        self.last_judgement = "Perfecto" if abs(candidate_offset) < 0.075 else "Bien"        
         self.last_hit_zone = zone
         self.last_hit_at = current_time
 
@@ -1153,8 +1168,8 @@ class RhythmGame:
         top_center_x = rect.centerx
         top_y = rect.y + 12
         bottom_y = rect.bottom - 86
-        strike_y = rect.bottom - 130
-        kick_y = rect.bottom - 58
+        strike_y = rect.bottom - 100 # Antes: - 130
+        kick_y = rect.bottom - 100   # Antes: - 58 (ahora son iguales)
 
         left_top = (top_center_x - (top_width / 2), top_y)
         right_top = (top_center_x + (top_width / 2), top_y)
@@ -1222,8 +1237,9 @@ class RhythmGame:
             radius = 28
             is_pressed = self._was_recent_zone_hit(self._lane_zone(lane_index))
             fill = color if is_pressed else (28, 28, 28)
-            pygame.draw.circle(self.screen, fill, (int(lane_x), int(strike_y + 42)), radius)
-            pygame.draw.circle(self.screen, color, (int(lane_x), int(strike_y + 42)), radius, 5)
+            # Se eliminó el + 42 para alinear perfectamente con el bombo y la zona de hit
+            pygame.draw.circle(self.screen, fill, (int(lane_x), int(strike_y)), radius)
+            pygame.draw.circle(self.screen, color, (int(lane_x), int(strike_y)), radius, 5)
 
         kick_pressed = self._was_recent_zone_hit("bombo")
         active_kick_color = (250, 250, 250) if kick_pressed else (185, 185, 185)
@@ -1256,7 +1272,7 @@ class RhythmGame:
                 continue
 
             lane_index = ZONE_TO_LANE[note.zone]
-            y = top_y + ((strike_y - 10 - top_y) * travel_progress)
+            y = top_y + ((strike_y - top_y) * travel_progress)
             lane_x = self._lane_center_x(left_top, left_bottom, right_top, right_bottom, y, lane_index)
             radius = max(12, int(12 + (progress * 18)))
             color = LANE_COLORS[lane_index]
@@ -1288,8 +1304,8 @@ class RhythmGame:
     def _current_song_time(self):
         if self.song_started_at is None:
             return 0.0
-
-        return max(0.0, (pygame.time.get_ticks() / 1000.0) - self.song_started_at)
+        # Cambiar el return agregando la resta del offset:
+        return (pygame.time.get_ticks() / 1000.0) - self.song_started_at - GLOBAL_OFFSET_SECONDS
 
     def _lane_center_x(self, left_top, left_bottom, right_top, right_bottom, y, lane_index):
         progress = self._vertical_progress(left_top[1], left_bottom[1], y)

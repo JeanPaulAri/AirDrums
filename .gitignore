@@ -45,7 +45,7 @@ __pycache__/
 venv/
 env/
 ENV/
-
+.python-version
 # =========================
 # Python env / logs
 # =========================

@@ -16,7 +16,14 @@ public class StickVisualizer : MonoBehaviour
     [Header("Hit Feedback")]
     [SerializeField] private float pulseScaleMultiplier = 1.15f;
     [SerializeField] private float pulseDuration = 0.08f;
+    
+    [SerializeField] private bool enableTilt = true;
+    [SerializeField] private float tiltStrength = 18f;
+    [SerializeField] private float tiltSmooth = 8f;
 
+    private Vector3 previousRenderedPosition;
+    private Quaternion targetRotation;
+    
     private Vector3 currentVelocity;
     private Vector3 targetLocalPosition;
     private Vector3 initialScale;
@@ -31,6 +38,8 @@ public class StickVisualizer : MonoBehaviour
 
         targetLocalPosition = visualTarget.localPosition;
         initialScale = visualTarget.localScale;
+        previousRenderedPosition = visualTarget.localPosition;
+        targetRotation = visualTarget.localRotation;
     }
 
     private void Update()
@@ -41,6 +50,24 @@ public class StickVisualizer : MonoBehaviour
             ref currentVelocity,
             smoothTime
         );
+
+        if (enableTilt)
+        {
+            Vector3 delta = visualTarget.localPosition - previousRenderedPosition;
+
+            float tiltX = -delta.y * tiltStrength;
+            float tiltZ = -delta.x * tiltStrength;
+
+            targetRotation = Quaternion.Euler(tiltX, 0f, tiltZ);
+
+            visualTarget.localRotation = Quaternion.Slerp(
+                visualTarget.localRotation,
+                targetRotation,
+                Time.deltaTime * tiltSmooth
+            );
+
+            previousRenderedPosition = visualTarget.localPosition;
+        }
     }
 
     public void SetNormalizedTrackingPosition(float normalizedX, float normalizedY)

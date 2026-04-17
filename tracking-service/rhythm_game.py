@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pygame
 
-
 # Tamaño de ventana y rendimiento.
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
@@ -62,7 +61,8 @@ LANE_COLORS = [
     (255, 157, 45),
 ]
 # Color del bombo.
-KICK_COLOR = (240, 240, 240)
+KICK_COLOR = (177, 80, 255)
+KICK_COLOR_PRESSED = (212, 160, 255)
 
 # Mapeo de zona de batería a carril visual.
 ZONE_TO_LANE = {
@@ -1242,7 +1242,7 @@ class RhythmGame:
             pygame.draw.circle(self.screen, color, (int(lane_x), int(strike_y)), radius, 5)
 
         kick_pressed = self._was_recent_zone_hit("bombo")
-        active_kick_color = (250, 250, 250) if kick_pressed else (185, 185, 185)
+        active_kick_color = KICK_COLOR_PRESSED if kick_pressed else KICK_COLOR
         pygame.draw.line(self.screen, active_kick_color, kick_left, kick_right, 12)
 
         for note in self.notes:

@@ -8,11 +8,9 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 5051
 UNITY_HOST = "127.0.0.1"
 UNITY_PORT = 5052
+GAME_UI_HOST = "127.0.0.1"
+GAME_UI_PORT = 5053
 BUFFER_SIZE = 65535
-
-STICK_1_LABEL = 1
-STICK_2_LABEL = 2
-STICK_3_LABEL = 3
 
 
 PAD_CODE_TO_ZONE = {
@@ -30,7 +28,6 @@ class AirDrumsMiddleware:
     def __init__(self):
         self.drum_zones = {}
         self.frame_size = {"dim_x": None, "dim_y": None}
-        self.last_positions = {}
         self.state_lock = threading.Lock()
         self.running = False
         self.listener_thread = None
@@ -50,7 +47,8 @@ class AirDrumsMiddleware:
         self.listener_thread.start()
         print(
             "[INFO] Middleware activo. Escuchando AirDrums en UDP "
-            f"{LISTEN_HOST}:{LISTEN_PORT} y reenviando a Unity en {UNITY_HOST}:{UNITY_PORT}"
+            f"{LISTEN_HOST}:{LISTEN_PORT}, Unity en {UNITY_HOST}:{UNITY_PORT} "
+            f"y Game UI en {GAME_UI_HOST}:{GAME_UI_PORT}"
         )
 
     # Detiene el middleware y cierra los sockets abiertos.
@@ -67,19 +65,18 @@ class AirDrumsMiddleware:
         except OSError:
             pass
 
-    # Espera paquetes UDP y captura el timestamp justo al momento de recibirlos.
+    # Espera paquetes UDP y entrega cada mensaje al flujo adecuado.
     def _listen_loop(self):
         while self.running:
             try:
                 data, address = self.listen_socket.recvfrom(BUFFER_SIZE)
-                received_at = time.time()
             except OSError:
                 break
 
-            self._handle_packet(data, address, received_at)
+            self._handle_packet(data, address)
 
     # Decodifica el JSON y envia cada mensaje al manejador que corresponda.
-    def _handle_packet(self, data, address, received_at):
+    def _handle_packet(self, data, address):
         try:
             message = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -97,7 +94,7 @@ class AirDrumsMiddleware:
             return
 
         if message_type == "golpe":
-            self._handle_hit(message, received_at)
+            self._handle_hit(message)
             return
 
         print(f"[WARN] Tipo de mensaje desconocido: {message_type}")
@@ -120,29 +117,11 @@ class AirDrumsMiddleware:
             "dim_y": message.get("dim_y"),
             "elementos": list(zones.values()),
         }
-        self._send_to_unity(unity_payload)
+        self._broadcast(unity_payload)
         print(f"[INFO] Configuracion cargada con zonas: {', '.join(zones.keys())}")
 
-    # Actualiza la ultima posicion conocida de ambas baquetas para inferir quien golpeo.
+    # Reenvia las posiciones al resto de clientes para depuracion y visualizacion.
     def _handle_position(self, message):
-        positions = {
-            STICK_1_LABEL: {
-                "x": message.get("stick_1_x"),
-                "y": message.get("stick_1_y"),
-            },
-            STICK_2_LABEL: {
-                "x": message.get("stick_2_x"),
-                "y": message.get("stick_2_y"),
-            },
-            STICK_3_LABEL: {
-                "x": message.get("stick_3_x"),
-                "y": message.get("stick_3_y"),
-            },
-        }
-
-        with self.state_lock:
-            self.last_positions = positions
-
         unity_payload = {
             "tipo": "posicion",
             "stick_1_x": message.get("stick_1_x"),
@@ -152,14 +131,12 @@ class AirDrumsMiddleware:
             "stick_3_x": message.get("stick_3_x"),
             "stick_3_y": message.get("stick_3_y"),
         }
-        self._send_to_unity(unity_payload)
+        self._broadcast(unity_payload)
 
-    # Convierte un golpe del sistema de vision en el mensaje final que Unity necesita.
-    def _handle_hit(self, message, received_at):
+    # Convierte un golpe del sistema de vision en el mensaje minimo de gameplay.
+    def _handle_hit(self, message):
         with self.state_lock:
             zones_ready = bool(self.drum_zones)
-            current_zones = dict(self.drum_zones)
-            current_positions = dict(self.last_positions)
 
         if not zones_ready:
             print("[WARN] Golpe ignorado porque aun no hay configuracion")
@@ -172,20 +149,8 @@ class AirDrumsMiddleware:
             print(f"[WARN] Pad desconocido en golpe: {message.get('pad')}")
             return
 
-        if zone == "bombo":
-            stick = 3
-        else:
-            stick = self._resolve_stick_for_zone(zone, current_zones, current_positions)
-            if stick is None:
-                print(f"[WARN] No se pudo inferir la baqueta para la zona {zone}")
-                return
-
-        payload = {
-            "zone": zone,
-            "stick": stick,
-            "timestamp": received_at,
-        }
-        self._send_to_unity(payload)
+        payload = {"zone": zone}
+        self._broadcast(payload)
 
     # Convierte la lista de elementos calibrados en un diccionario simple de zonas y coordenadas.
     def _parse_configuration(self, message):
@@ -225,48 +190,18 @@ class AirDrumsMiddleware:
 
         return str(raw_code).strip().replace(" ", "")
 
-    # Decide que baqueta estuvo mas cerca del pad golpeado usando la ultima posicion recibida.
-    def _resolve_stick_for_zone(self, zone, zones, positions):
-        zone_info = zones.get(zone)
-        if zone_info is None:
-            return None
-
-        zone_x = zone_info.get("x")
-        zone_y = zone_info.get("y")
-        if zone_x is None or zone_y is None:
-            return None
-
-        best_stick = None
-        best_distance = None
-
-        for stick_name in (STICK_1_LABEL, STICK_2_LABEL):
-            stick_position = positions.get(stick_name, {})
-            stick_x = stick_position.get("x")
-            stick_y = stick_position.get("y")
-            if stick_x is None or stick_y is None:
-                continue
-
-            distance = self._distance_squared(zone_x, zone_y, stick_x, stick_y)
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_stick = stick_name
-
-        return best_stick
-
-    # Reenvia a Unity el mensaje que corresponda, ya sea visualizacion o evento de juego.
-    def _send_to_unity(self, payload):
+    # Reenvia a los consumidores el mensaje que corresponda.
+    def _broadcast(self, payload):
         try:
             encoded = json.dumps(payload).encode("utf-8")
-            self.unity_socket.sendto(encoded, (UNITY_HOST, UNITY_PORT))
+            for host, port in (
+                (UNITY_HOST, UNITY_PORT),
+                (GAME_UI_HOST, GAME_UI_PORT),
+            ):
+                self.unity_socket.sendto(encoded, (host, port))
             print(f"[SEND] {payload}")
         except OSError as error:
-            print(f"[WARN] No se pudo enviar a Unity: {error}")
-
-    # Calcula distancia al cuadrado para comparar cercania sin usar raiz cuadrada.
-    def _distance_squared(self, x1, y1, x2, y2):
-        dx = x1 - x2
-        dy = y1 - y2
-        return (dx * dx) + (dy * dy)
+            print(f"[WARN] No se pudo enviar a un cliente: {error}")
 
 
 # Levanta el middleware y lo mantiene activo hasta que el usuario lo detenga manualmente.

@@ -11,7 +11,7 @@ import socket
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
-
+import os
 import pygame
 
 # Tamaño de ventana y rendimiento.
@@ -738,6 +738,25 @@ class RhythmGame:
         pygame.init()
         pygame.mixer.init()
         pygame.mixer.set_num_channels(8)
+        # --- NUEVO CÓDIGO ---
+        # 1. Obtiene la resolución de la pantalla principal
+        minfo = pygame.display.Info()
+        screen_width = minfo.current_w
+        screen_height = minfo.current_w
+        
+        # 2. Calcula para que ocupe la mitad derecha
+        half_width = screen_width // 2
+        
+        # 3. Le indica a SDL (Pygame) en qué coordenada colocar la ventana
+        # 'x,y' -> arranca en el centro (anchura / 2) y en lo más alto (0)
+        os.environ['SDL_VIDEO_WINDOW_POS'] = f"{half_width},0"
+        
+        # 4. Asigna el nuevo tamaño (mitad del ancho, alto completo)
+        global WINDOW_WIDTH, WINDOW_HEIGHT
+        WINDOW_WIDTH = half_width
+        WINDOW_HEIGHT = minfo.current_h
+        # --------------------
+        
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption(APP_TITLE)
         self.clock = pygame.time.Clock()

@@ -5,15 +5,20 @@ y sincroniza audio (song/vocals/rhythm/drums_1..4) con el gameplay.
 """
 
 import configparser
+import concurrent.futures
+import importlib.util
 import json
 import math
 import socket
+import subprocess
+import sys
+import unicodedata
+from collections import deque
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
-
+import os
 import pygame
-
 
 # Tamaño de ventana y rendimiento.
 WINDOW_WIDTH = 1280
@@ -28,6 +33,15 @@ UDP_BUFFER_SIZE = 2048
 # Título y carpeta base de canciones.
 APP_TITLE = "AirDrums Rhythm Highway"
 SONGS_DIR = Path(__file__).resolve().parent / "assets" / "songs"
+TRACKING_SCRIPT_PATH = Path(__file__).resolve().parent / "main.py"
+VOICE_LISTENER_SCRIPT_PATH = Path(__file__).resolve().parent / "voice_listener.ps1"
+VOICE_COMMAND_PATH = Path(__file__).resolve().parent / "_voice_command.json"
+CREDIT_LINES = [
+    "AirDrums",
+    "Proyecto universitario de interaccion humano-computador",
+    "Equipo creador: actualiza estos nombres en CREDIT_LINES",
+    "Apoyo tecnico: Codex",
+]
 
 # Paleta de colores UI.
 BACKGROUND_TOP = (16, 12, 22)
@@ -62,7 +76,8 @@ LANE_COLORS = [
     (255, 157, 45),
 ]
 # Color del bombo.
-KICK_COLOR = (240, 240, 240)
+KICK_COLOR = (177, 80, 255)
+KICK_COLOR_PRESSED = (212, 160, 255)
 
 # Mapeo de zona de batería a carril visual.
 ZONE_TO_LANE = {
@@ -133,10 +148,269 @@ class SongData:
     vocals_path: Path | None
     rhythm_path: Path | None
     drums_paths: list[Path]
+    base_notes: list[Note]
     notes: list[Note]
     length_seconds: float
     source_name: str
     inferred_kick: bool
+
+
+@dataclass(frozen=True)
+class DifficultyProfile:
+    """Parámetros de simplificación y supervivencia por dificultad."""
+    key: str
+    label: str
+    note_gap_seconds: float
+    kick_gap_seconds: float
+    chord_window_seconds: float
+    global_min_gap_seconds: float
+    max_notes_per_second: int
+    health_gain_hit: float
+    health_loss_miss: float
+    health_loss_bad_hit: float
+    fail_streak: int
+    gap_fill_threshold_seconds: float
+    gap_fill_max_notes: int
+    fill_zones: tuple[str, ...]
+    max_kicks_in_window: int
+    kick_density_window_seconds: float
+
+
+DIFFICULTY_ORDER = ["easy", "medium", "hard"]
+DIFFICULTY_PROFILES = {
+    "easy": DifficultyProfile(
+        key="easy",
+        label="Facil",
+        note_gap_seconds=DRUM_FRIENDLY_NOTE_GAP_SECONDS,
+        kick_gap_seconds=DRUM_FRIENDLY_KICK_GAP_SECONDS,
+        chord_window_seconds=DRUM_CHORD_WINDOW_SECONDS,
+        global_min_gap_seconds=DRUM_GLOBAL_MIN_GAP_SECONDS,
+        max_notes_per_second=DRUM_MAX_NOTES_PER_SECOND,
+        health_gain_hit=0.028,
+        health_loss_miss=0.060,
+        health_loss_bad_hit=0.028,
+        fail_streak=14,
+        gap_fill_threshold_seconds=99.0,
+        gap_fill_max_notes=0,
+        fill_zones=(),
+        max_kicks_in_window=2,
+        kick_density_window_seconds=1.35,
+    ),
+    "medium": DifficultyProfile(
+        key="medium",
+        label="Medio",
+        note_gap_seconds=0.19,
+        kick_gap_seconds=0.36,
+        chord_window_seconds=0.10,
+        global_min_gap_seconds=0.14,
+        max_notes_per_second=6,
+        health_gain_hit=0.022,
+        health_loss_miss=0.045,
+        health_loss_bad_hit=0.022,
+        fail_streak=16,
+        gap_fill_threshold_seconds=0.72,
+        gap_fill_max_notes=1,
+        fill_zones=("hithat", "tom superior", "hithat", "tom inferior"),
+        max_kicks_in_window=2,
+        kick_density_window_seconds=1.1,
+    ),
+    "hard": DifficultyProfile(
+        key="hard",
+        label="Dificil",
+        note_gap_seconds=0.11,
+        kick_gap_seconds=0.24,
+        chord_window_seconds=0.05,
+        global_min_gap_seconds=0.07,
+        max_notes_per_second=9,
+        health_gain_hit=0.020,
+        health_loss_miss=0.055,
+        health_loss_bad_hit=0.026,
+        fail_streak=14,
+        gap_fill_threshold_seconds=0.42,
+        gap_fill_max_notes=2,
+        fill_zones=("hithat", "tom superior", "tom inferior", "platillo", "tom superior", "tom inferior"),
+        max_kicks_in_window=3,
+        kick_density_window_seconds=1.0,
+    ),
+}
+
+
+class VoiceCommandListener:
+    """Escucha comandos de voz con libreria Python y usa Windows como respaldo."""
+    def __init__(self, script_path: Path, output_path: Path):
+        self.script_path = script_path
+        self.output_path = output_path
+        self.process = None
+        self.last_timestamp = None
+        self.available = False
+        self.status_message = "Voz no inicializada"
+        self.backend_name = "Ninguno"
+        self.pending_commands = deque()
+        self.pending_audio = deque(maxlen=1)
+        self.stop_listening = None
+        self.recognizer = None
+        self.microphone = None
+        self.executor = None
+        self.recognition_future = None
+
+    def start(self):
+        if self._start_python_microphone():
+            return
+        self._start_windows_fallback()
+
+    def _start_python_microphone(self):
+        if importlib.util.find_spec("speech_recognition") is None or importlib.util.find_spec("pyaudio") is None:
+            return False
+
+        try:
+            import speech_recognition as sr
+
+            self.recognizer = sr.Recognizer()
+            self.recognizer.dynamic_energy_threshold = True
+            self.recognizer.energy_threshold = 250
+            self.recognizer.pause_threshold = 0.35
+            self.recognizer.non_speaking_duration = 0.18
+            self.recognizer.operation_timeout = 2.0
+            self.microphone = sr.Microphone()
+            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            self.stop_listening = self.recognizer.listen_in_background(
+                self.microphone,
+                self._python_callback,
+                phrase_time_limit=1.5,
+            )
+            self.available = True
+            self.backend_name = "Microfono Python"
+            self.status_message = "Voz lista con SpeechRecognition"
+            return True
+        except Exception as exc:
+            self.available = False
+            self.backend_name = "Ninguno"
+            self.status_message = f"No pude iniciar SpeechRecognition: {exc}"
+            return False
+
+    def _python_callback(self, recognizer, audio):
+        if self.pending_audio.maxlen and len(self.pending_audio) >= self.pending_audio.maxlen:
+            self.pending_audio.clear()
+        self.pending_audio.append(audio)
+
+    def _recognize_audio(self, audio):
+        recognized_text = None
+        try:
+            recognized_text = self.recognizer.recognize_google(audio, language="es-ES")
+        except Exception:
+            try:
+                recognized_text = self.recognizer.recognize_google(audio, language="es-MX")
+            except Exception:
+                try:
+                    recognized_text = self.recognizer.recognize_sphinx(audio)
+                except Exception:
+                    recognized_text = None
+        return recognized_text
+
+    def _poll_python_command(self):
+        if self.recognition_future is not None and self.recognition_future.done():
+            try:
+                recognized_text = self.recognition_future.result()
+            except Exception:
+                recognized_text = None
+            self.recognition_future = None
+            if recognized_text:
+                self.pending_commands.append(recognized_text)
+
+        if self.recognition_future is None and self.pending_audio and self.executor is not None:
+            next_audio = self.pending_audio.popleft()
+            self.recognition_future = self.executor.submit(self._recognize_audio, next_audio)
+
+    def _start_windows_fallback(self):
+        if not self.script_path.exists():
+            self.status_message = "No encontre el listener de voz"
+            self.backend_name = "Ninguno"
+            return
+
+        try:
+            if self.output_path.exists():
+                self.output_path.unlink()
+        except OSError:
+            pass
+
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(self.script_path),
+            "-OutputPath",
+            str(self.output_path),
+        ]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=str(self.script_path.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.available = True
+            self.backend_name = "Microfono Windows"
+            self.status_message = "Voz lista"
+        except OSError:
+            self.process = None
+            self.available = False
+            self.backend_name = "Ninguno"
+            self.status_message = "No pude iniciar voz de Windows"
+
+    def poll_command(self):
+        if self.backend_name == "Microfono Python":
+            self._poll_python_command()
+        if self.pending_commands:
+            return self.pending_commands.popleft()
+        if self.process is not None and self.process.poll() is not None:
+            self.available = False
+            self.status_message = "El listener de voz se cerro"
+            return None
+        if not self.available or not self.output_path.exists():
+            return None
+
+        try:
+            payload = json.loads(self.output_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        timestamp = payload.get("timestamp")
+        if not timestamp or timestamp == self.last_timestamp:
+            return None
+
+        self.last_timestamp = timestamp
+        return payload.get("command")
+
+    def stop(self):
+        if self.stop_listening is not None:
+            try:
+                self.stop_listening(wait_for_stop=False)
+            except Exception:
+                pass
+        self.stop_listening = None
+        if self.executor is not None:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        self.executor = None
+        self.recognition_future = None
+        if self.process is not None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except Exception:
+                pass
+        self.process = None
+        try:
+            if self.output_path.exists():
+                self.output_path.unlink()
+        except OSError:
+            pass
 
 
 class UdpHitReceiver:
@@ -208,10 +482,12 @@ class SongLoader:
             return None
 
         metadata = self._read_song_ini(song_ini_path)
-        midi_notes, chart_length, source_name, inferred_kick = self._read_chart(midi_path)
+        base_notes, chart_length, source_name, inferred_kick = self._read_chart(midi_path)
 
-        if not midi_notes:
+        if not base_notes:
             return None
+
+        easy_notes = self.build_playable_notes(base_notes, "easy")
 
         return SongData(
             title=metadata.get("name", folder.name),
@@ -223,7 +499,8 @@ class SongLoader:
             vocals_path=vocals_path if vocals_path.exists() else None,
             rhythm_path=rhythm_path if rhythm_path.exists() else None,
             drums_paths=drums_paths,
-            notes=midi_notes,
+            base_notes=self._clone_notes(base_notes),
+            notes=easy_notes,
             length_seconds=max(chart_length, float(metadata.get("song_length", "0")) / 1000.0),
             source_name=source_name,
             inferred_kick=inferred_kick,
@@ -268,7 +545,6 @@ class SongLoader:
         if "PART DRUMS" in track_notes:
             notes = self._build_notes_from_track(track_notes["PART DRUMS"], converter, DRUM_EXPERT_MAP)
             notes = self._cleanup_real_drum_chart(notes)
-            notes = self._simplify_for_drums(notes)
             return notes, self._song_length_seconds(notes), "PART DRUMS", False
 
         # Only accept true drum charts for Drum Hero mode
@@ -479,30 +755,81 @@ class SongLoader:
 
         return kicks
 
-    def _simplify_for_drums(self, notes):
+    def _clone_notes(self, notes):
+        return [Note(time=note.time, zone=note.zone) for note in notes]
+
+    def build_playable_notes(self, base_notes, difficulty_key):
+        profile = DIFFICULTY_PROFILES.get(difficulty_key, DIFFICULTY_PROFILES["easy"])
+        notes = self._clone_notes(base_notes)
+        notes = self._simplify_for_drums(notes, profile)
+        notes = self._augment_notes_for_difficulty(notes, profile)
+        notes.sort(key=lambda note: note.time)
+        return self._simplify_for_drums(notes, profile)
+
+    def _augment_notes_for_difficulty(self, notes, profile: DifficultyProfile):
+        if profile.gap_fill_max_notes <= 0 or not profile.fill_zones:
+            return notes
+
+        augmented = self._clone_notes(notes)
+        non_kick_notes = [note for note in notes if note.zone != "bombo"]
+        fill_zone_index = 0
+
+        for previous_note, next_note in zip(non_kick_notes, non_kick_notes[1:]):
+            gap = next_note.time - previous_note.time
+            if gap < profile.gap_fill_threshold_seconds:
+                continue
+
+            extra_notes = min(profile.gap_fill_max_notes, max(1, int(gap / profile.gap_fill_threshold_seconds)))
+            for insert_index in range(extra_notes):
+                insert_time = previous_note.time + (gap * ((insert_index + 1) / (extra_notes + 1)))
+                if self._has_nearby_note(augmented, insert_time, 0.12):
+                    continue
+
+                zone = profile.fill_zones[fill_zone_index % len(profile.fill_zones)]
+                fill_zone_index += 1
+                if previous_note.zone == zone and next_note.zone == zone:
+                    continue
+                augmented.append(Note(time=insert_time, zone=zone))
+
+        return augmented
+
+    def _has_nearby_note(self, notes, target_time: float, threshold: float):
+        for note in notes:
+            if abs(note.time - target_time) <= threshold:
+                return True
+        return False
+
+    def _simplify_for_drums(self, notes, profile: DifficultyProfile | None = None):
         """Filtra notas muy densas para que el chart sea tocable en batería."""
+        profile = profile or DIFFICULTY_PROFILES["easy"]
         reduced = []
         last_global_time = -999.0
         last_zone_times = {}
         last_non_kick_time = -999.0
         recent_times = []
+        recent_kick_times = []
 
         for note in notes:
-            min_gap = DRUM_FRIENDLY_KICK_GAP_SECONDS if note.zone == "bombo" else DRUM_FRIENDLY_NOTE_GAP_SECONDS
+            min_gap = profile.kick_gap_seconds if note.zone == "bombo" else profile.note_gap_seconds
             last_zone_time = last_zone_times.get(note.zone, -999.0)
 
             if note.time - last_zone_time < min_gap:
                 continue
 
-            if note.zone != "bombo" and note.time - last_non_kick_time < DRUM_CHORD_WINDOW_SECONDS:
+            if note.zone == "bombo":
+                recent_kick_times = [t for t in recent_kick_times if note.time - t <= profile.kick_density_window_seconds]
+                if len(recent_kick_times) >= profile.max_kicks_in_window:
+                    continue
+
+            if note.zone != "bombo" and note.time - last_non_kick_time < profile.chord_window_seconds:
                 continue
 
-            if note.zone != "bombo" and note.time - last_global_time < DRUM_GLOBAL_MIN_GAP_SECONDS:
+            if note.zone != "bombo" and note.time - last_global_time < profile.global_min_gap_seconds:
                 continue
 
             # Global density cap: allow at most DRUM_MAX_NOTES_PER_SECOND hits in the last second
             recent_times = [t for t in recent_times if note.time - t <= 1.0]
-            if len(recent_times) >= DRUM_MAX_NOTES_PER_SECOND:
+            if len(recent_times) >= profile.max_notes_per_second:
                 continue
 
             reduced.append(note)
@@ -510,6 +837,8 @@ class SongLoader:
             last_global_time = note.time
             if note.zone != "bombo":
                 last_non_kick_time = note.time
+            else:
+                recent_kick_times.append(note.time)
             recent_times.append(note.time)
 
         return reduced
@@ -553,7 +882,7 @@ class SongLoader:
             notes = []
 
         # Apply simplification to avoid dense charts
-        notes = self._simplify_for_drums(notes)
+        notes = self._simplify_for_drums(notes, DIFFICULTY_PROFILES["easy"])
 
         # Map zones to MIDI percussion note numbers (reverse mapping of DRUM_EXPERT_MAP)
         zone_to_midi = {
@@ -676,6 +1005,10 @@ class SongLoader:
             charter="Codex",
             audio_path=None,
             cover_path=None,
+            vocals_path=None,
+            rhythm_path=None,
+            drums_paths=[],
+            base_notes=self._clone_notes(notes),
             notes=notes,
             length_seconds=max(note.time for note in notes) + 4.0,
             source_name="DEMO",
@@ -738,9 +1071,29 @@ class RhythmGame:
         pygame.init()
         pygame.mixer.init()
         pygame.mixer.set_num_channels(8)
+        # --- NUEVO CÓDIGO ---
+        # 1. Obtiene la resolución de la pantalla principal
+        minfo = pygame.display.Info()
+        screen_width = minfo.current_w
+        screen_height = minfo.current_w
+        
+        # 2. Calcula para que ocupe la mitad derecha
+        half_width = screen_width // 2
+        
+        # 3. Le indica a SDL (Pygame) en qué coordenada colocar la ventana
+        # 'x,y' -> arranca en el centro (anchura / 2) y en lo más alto (0)
+        os.environ['SDL_VIDEO_WINDOW_POS'] = f"{half_width},0"
+        
+        # 4. Asigna el nuevo tamaño (mitad del ancho, alto completo)
+        global WINDOW_WIDTH, WINDOW_HEIGHT
+        WINDOW_WIDTH = half_width
+        WINDOW_HEIGHT = minfo.current_h
+        # --------------------
+        
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption(APP_TITLE)
         self.clock = pygame.time.Clock()
+        self.song_loader = SongLoader()
 
         self.title_font = pygame.font.SysFont("arial", 42, bold=True)
         self.ui_font = pygame.font.SysFont("arial", 24, bold=True)
@@ -748,8 +1101,9 @@ class RhythmGame:
         self.tiny_font = pygame.font.SysFont("arial", 16)
 
         self.receiver = UdpHitReceiver(UDP_HOST, UDP_PORT)
-        self.song_library = SongLoader().load_all_songs()
+        self.song_library = self.song_loader.load_all_songs()
         self.selected_song_index = 0
+        self.selected_difficulty = "easy"
         self.song_data = None
         self.notes = []
         self.song_length = 0.0
@@ -762,17 +1116,53 @@ class RhythmGame:
         self.drums_channels = [pygame.mixer.Channel(3), pygame.mixer.Channel(4), pygame.mixer.Channel(5), pygame.mixer.Channel(6)]
         self._apply_song_selection(self.selected_song_index)
 
-        self.state = "intro"
+        self.state = "main_menu"
         self.song_started_at = None
         self.music_started = False
         self.running = True
+        self.pause_started_at = None
+        self.accumulated_pause_seconds = 0.0
+        self.return_state = "main_menu"
+        self.command_buffer = ""
+        self.command_feedback = "Escribe un comando y presiona ENTER"
+        self.command_feedback_until = 0.0
+        self.main_menu_options = ["Jugar", "Calibrar", "Creditos", "Salir"]
+        self.main_menu_index = 0
+        self.pause_menu_options = ["Continuar", "Reiniciar", "Cambiar nivel", "Salir"]
+        self.pause_menu_index = 0
+        self.pause_difficulty_options = ["Facil", "Normal", "Dificil", "Atras"]
+        self.pause_difficulty_index = 0
+        self.confirm_options = ["Si", "No"]
+        self.confirm_index = 1
+        self.confirm_context = "return_to_pause"
+        self.voice_listener = VoiceCommandListener(VOICE_LISTENER_SCRIPT_PATH, VOICE_COMMAND_PATH)
+        self.voice_listener.start()
+        self.voice_backend_name = self._detect_voice_backend_name()
 
         self.score = 0
         self.combo = 0
         self.best_combo = 0
+        self.health = 0.50
+        self.display_health = self.health
+        self.miss_streak = 0
         self.last_hit_zone = None
         self.last_hit_at = -999.0
         self.last_judgement = "Listo para tocar"
+        self.failure_started_at = None
+        self.failed_message = ""
+        if "microfono" in self.voice_backend_name.lower():
+            self.command_feedback = "Voz activa: menu o pausa en partida; jugar, calibrar, creditos, salir"
+        elif "micro no configurado" in self.voice_backend_name.lower():
+            self.command_feedback = "El micro no esta activo aqui: faltan speech_recognition y pyaudio"
+
+    def _detect_voice_backend_name(self):
+        if getattr(self, "voice_listener", None) is not None and self.voice_listener.available:
+            return self.voice_listener.backend_name
+        has_speech = importlib.util.find_spec("speech_recognition") is not None
+        has_audio = importlib.util.find_spec("pyaudio") is not None
+        if has_speech and has_audio:
+            return "Microfono"
+        return "Texto (micro no configurado)"
 
     def run(self):
         """Bucle principal de render + update."""
@@ -784,6 +1174,7 @@ class RhythmGame:
                 self._draw()
         finally:
             pygame.mixer.music.stop()
+            self.voice_listener.stop()
             self.receiver.close()
             pygame.quit()
 
@@ -796,7 +1187,7 @@ class RhythmGame:
         except pygame.error:
             return None
 
-        return pygame.transform.smoothscale(surface, (220, 220))
+        return pygame.transform.smoothscale(surface, (190, 190))
 
     def _handle_events(self):
         for event in pygame.event.get():
@@ -804,33 +1195,140 @@ class RhythmGame:
                 self.running = False
                 return
 
+            if event.type == pygame.TEXTINPUT:
+                if self._supports_command_input():
+                    self.command_buffer += event.text
+                continue
+
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    self.running = False
+                    if self.state == "playing":
+                        self._pause_game()
+                    elif self.state == "paused":
+                        self._resume_game()
+                    elif self.state == "pause_difficulty":
+                        self.state = "paused"
+                    elif self.state == "confirm":
+                        self._cancel_confirmation()
+                    elif self.state in ("song_select", "credits"):
+                        self._go_to_main_menu()
+                    else:
+                        self.running = False
                     return
 
-                if self.state == "intro" and event.key == pygame.K_DOWN:
+                if self._supports_command_input():
+                    if event.key == pygame.K_BACKSPACE:
+                        self.command_buffer = self.command_buffer[:-1]
+                        continue
+                    if event.key == pygame.K_RETURN and self.command_buffer.strip():
+                        self._submit_command(self.command_buffer)
+                        self.command_buffer = ""
+                        continue
+
+                if self.state == "main_menu" and event.key == pygame.K_DOWN:
+                    self.main_menu_index = (self.main_menu_index + 1) % len(self.main_menu_options)
+                    continue
+
+                if self.state == "main_menu" and event.key == pygame.K_UP:
+                    self.main_menu_index = (self.main_menu_index - 1) % len(self.main_menu_options)
+                    continue
+
+                if self.state == "main_menu" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self._activate_main_menu_option(self.main_menu_options[self.main_menu_index])
+                    continue
+
+                if self.state == "song_select" and event.key == pygame.K_DOWN:
                     self._apply_song_selection(self.selected_song_index + 1)
                     continue
 
-                if self.state == "intro" and event.key == pygame.K_UP:
+                if self.state == "song_select" and event.key == pygame.K_UP:
                     self._apply_song_selection(self.selected_song_index - 1)
                     continue
 
-                if self.state == "intro" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                if self.state == "song_select" and event.key in (pygame.K_LEFT, pygame.K_q):
+                    self._cycle_difficulty(-1)
+                    continue
+
+                if self.state == "song_select" and event.key in (pygame.K_RIGHT, pygame.K_e):
+                    self._cycle_difficulty(1)
+                    continue
+
+                if self.state == "song_select" and event.key == pygame.K_1:
+                    self._set_difficulty("easy")
+                    continue
+
+                if self.state == "song_select" and event.key == pygame.K_2:
+                    self._set_difficulty("medium")
+                    continue
+
+                if self.state == "song_select" and event.key == pygame.K_3:
+                    self._set_difficulty("hard")
+                    continue
+
+                if self.state == "song_select" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
                     self._start_song()
                     continue
 
-                if self.state == "finished" and event.key == pygame.K_RETURN:
+                if self.state in ("finished", "failed") and event.key == pygame.K_RETURN:
                     self._restart_song()
+                    continue
+
+                if self.state == "playing" and event.key == pygame.K_m:
+                    self._pause_game()
+                    continue
+
+                if self.state == "paused" and event.key == pygame.K_DOWN:
+                    self.pause_menu_index = (self.pause_menu_index + 1) % len(self.pause_menu_options)
+                    continue
+
+                if self.state == "paused" and event.key == pygame.K_UP:
+                    self.pause_menu_index = (self.pause_menu_index - 1) % len(self.pause_menu_options)
+                    continue
+
+                if self.state == "paused" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self._activate_pause_menu_option(self.pause_menu_options[self.pause_menu_index])
+                    continue
+
+                if self.state == "pause_difficulty" and event.key == pygame.K_DOWN:
+                    self.pause_difficulty_index = (self.pause_difficulty_index + 1) % len(self.pause_difficulty_options)
+                    continue
+
+                if self.state == "pause_difficulty" and event.key == pygame.K_UP:
+                    self.pause_difficulty_index = (self.pause_difficulty_index - 1) % len(self.pause_difficulty_options)
+                    continue
+
+                if self.state == "pause_difficulty" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self._activate_pause_difficulty_option(self.pause_difficulty_options[self.pause_difficulty_index])
+                    continue
+
+                if self.state == "confirm" and event.key == pygame.K_LEFT:
+                    self.confirm_index = (self.confirm_index - 1) % len(self.confirm_options)
+                    continue
+
+                if self.state == "confirm" and event.key == pygame.K_RIGHT:
+                    self.confirm_index = (self.confirm_index + 1) % len(self.confirm_options)
+                    continue
+
+                if self.state == "confirm" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self._resolve_confirmation(self.confirm_options[self.confirm_index] == "Si")
                     continue
 
                 zone = KEYBOARD_ZONE_MAP.get(event.key)
                 if zone and self.state == "playing":
                     self._register_hit(zone)
 
-    def _update(self, _dt: float):
+    def _update(self, dt: float):
         current_time = pygame.time.get_ticks() / 1000.0
+        self.display_health += (self.health - self.display_health) * min(1.0, dt * 8.0)
+
+        if self.command_feedback_until and current_time > self.command_feedback_until:
+            self.command_feedback_until = 0.0
+            self.command_feedback = "Escribe un comando y presiona ENTER"
+
+        voice_command = self.voice_listener.poll_command()
+        if voice_command:
+            self._submit_command(voice_command)
+            self._show_command_feedback(f"Voz: {voice_command}")
 
         if self.state == "playing":
             if self.song_started_at is not None and current_time >= self.song_started_at and not self.music_started:
@@ -845,6 +1343,295 @@ class RhythmGame:
             if song_time >= self.song_length:
                 self.state = "finished"
                 pygame.mixer.music.stop()
+
+    def _supports_command_input(self):
+        return self.state in {
+            "main_menu",
+            "song_select",
+            "credits",
+            "paused",
+            "pause_difficulty",
+            "confirm",
+            "finished",
+            "failed",
+        }
+
+    def _normalize_command(self, command: str):
+        lowered = command.strip().lower()
+        normalized = unicodedata.normalize("NFD", lowered)
+        normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
+        normalized = " ".join(normalized.split())
+        number_aliases = {
+            "normal": "medio",
+        }
+        return number_aliases.get(normalized, normalized)
+
+    def _show_command_feedback(self, message: str, duration: float = 2.6):
+        self.command_feedback = message
+        self.command_feedback_until = (pygame.time.get_ticks() / 1000.0) + duration
+
+    def _submit_command(self, raw_command: str):
+        command = self._normalize_command(raw_command)
+        if not command:
+            return
+
+        handled = False
+        if self.state == "main_menu":
+            handled = self._handle_main_menu_command(command)
+        elif self.state == "song_select":
+            handled = self._handle_song_select_command(command)
+        elif self.state == "playing":
+            handled = self._handle_playing_command(command)
+        elif self.state == "paused":
+            handled = self._handle_paused_command(command)
+        elif self.state == "pause_difficulty":
+            handled = self._handle_pause_difficulty_command(command)
+        elif self.state == "confirm":
+            handled = self._handle_confirm_command(command)
+        elif self.state == "credits":
+            handled = self._handle_credits_command(command)
+        elif self.state in ("finished", "failed"):
+            handled = self._handle_end_state_command(command)
+
+        if not handled:
+            self._show_command_feedback(f"No entendi '{raw_command.strip()}'")
+
+    def _command_matches(self, command: str, *options: str):
+        return command in options
+
+    def _handle_main_menu_command(self, command: str):
+        if self._command_matches(command, "jugar"):
+            self._activate_main_menu_option("Jugar")
+            return True
+        if self._command_matches(command, "calibrar", "calibracion"):
+            self._activate_main_menu_option("Calibrar")
+            return True
+        if self._command_matches(command, "creditos", "creditos del juego"):
+            self._activate_main_menu_option("Creditos")
+            return True
+        if self._command_matches(command, "salir"):
+            self._activate_main_menu_option("Salir")
+            return True
+        return False
+
+    def _handle_song_select_command(self, command: str):
+        if self._command_matches(command, "siguiente"):
+            self._apply_song_selection(self.selected_song_index + 1)
+            return True
+        if self._command_matches(command, "atras", "anterior"):
+            self._apply_song_selection(self.selected_song_index - 1)
+            return True
+        if self._command_matches(command, "volver", "menu"):
+            self._go_to_main_menu()
+            return True
+        if self._command_matches(command, "jugar", "empezar"):
+            self._start_song()
+            return True
+        if self._command_matches(command, "facil"):
+            self._set_difficulty("easy")
+            self._show_command_feedback("Dificultad: Facil")
+            return True
+        if self._command_matches(command, "medio"):
+            self._set_difficulty("medium")
+            self._show_command_feedback("Dificultad: Medio")
+            return True
+        if self._command_matches(command, "dificil"):
+            self._set_difficulty("hard")
+            self._show_command_feedback("Dificultad: Dificil")
+            return True
+        return False
+
+    def _handle_playing_command(self, command: str):
+        if self._command_matches(command, "menu", "pausa", "pause", "parar", "detener"):
+            self._pause_game()
+            return True
+        return False
+
+    def _handle_paused_command(self, command: str):
+        if self._command_matches(command, "continuar"):
+            self._resume_game()
+            return True
+        if self._command_matches(command, "reiniciar"):
+            self._restart_current_song()
+            return True
+        if self._command_matches(command, "cambiar nivel", "nivel", "dificultad"):
+            self.state = "pause_difficulty"
+            return True
+        if self._command_matches(command, "salir"):
+            self._open_exit_confirmation("return_to_song_select")
+            return True
+        if self._command_matches(command, "volver"):
+            self._resume_game()
+            return True
+        return False
+
+    def _handle_pause_difficulty_command(self, command: str):
+        if self._command_matches(command, "facil"):
+            self._set_difficulty("easy")
+            self._restart_current_song()
+            return True
+        if self._command_matches(command, "normal", "medio"):
+            self._set_difficulty("medium")
+            self._restart_current_song()
+            return True
+        if self._command_matches(command, "dificil"):
+            self._set_difficulty("hard")
+            self._restart_current_song()
+            return True
+        if self._command_matches(command, "atras", "volver"):
+            self.state = "paused"
+            return True
+        return False
+
+    def _handle_confirm_command(self, command: str):
+        if self._command_matches(command, "si"):
+            self._resolve_confirmation(True)
+            return True
+        if self._command_matches(command, "no", "atras", "volver"):
+            self._resolve_confirmation(False)
+            return True
+        return False
+
+    def _handle_credits_command(self, command: str):
+        if self._command_matches(command, "volver", "atras", "menu"):
+            self._go_to_main_menu()
+            return True
+        return False
+
+    def _handle_end_state_command(self, command: str):
+        if self._command_matches(command, "volver", "menu"):
+            self._restart_song()
+            return True
+        if self._command_matches(command, "reiniciar"):
+            self._start_song()
+            return True
+        return False
+
+    def _activate_main_menu_option(self, option: str):
+        if option == "Jugar":
+            self.state = "song_select"
+            self._show_command_feedback("Menu de canciones listo")
+        elif option == "Calibrar":
+            self._run_calibration_flow()
+        elif option == "Creditos":
+            self.state = "credits"
+        elif option == "Salir":
+            self.running = False
+
+    def _activate_pause_menu_option(self, option: str):
+        if option == "Continuar":
+            self._resume_game()
+        elif option == "Reiniciar":
+            self._restart_current_song()
+        elif option == "Cambiar nivel":
+            self.state = "pause_difficulty"
+        elif option == "Salir":
+            self._open_exit_confirmation("return_to_song_select")
+
+    def _activate_pause_difficulty_option(self, option: str):
+        if option == "Facil":
+            self._set_difficulty("easy")
+            self._restart_current_song()
+        elif option == "Normal":
+            self._set_difficulty("medium")
+            self._restart_current_song()
+        elif option == "Dificil":
+            self._set_difficulty("hard")
+            self._restart_current_song()
+        elif option == "Atras":
+            self.state = "paused"
+
+    def _pause_game(self):
+        if self.state != "playing":
+            return
+        self.state = "paused"
+        self.pause_menu_index = 0
+        self.pause_started_at = pygame.time.get_ticks() / 1000.0
+        pygame.mixer.music.pause()
+        try:
+            self.vocals_channel.pause()
+            self.rhythm_channel.pause()
+            for channel in self.drums_channels:
+                channel.pause()
+        except Exception:
+            pass
+
+    def _resume_game(self):
+        if self.state != "paused":
+            return
+        if self.pause_started_at is not None:
+            self.accumulated_pause_seconds += (pygame.time.get_ticks() / 1000.0) - self.pause_started_at
+            self.pause_started_at = None
+        self.state = "playing"
+        pygame.mixer.music.unpause()
+        try:
+            self.vocals_channel.unpause()
+            self.rhythm_channel.unpause()
+            for channel in self.drums_channels:
+                channel.unpause()
+        except Exception:
+            pass
+
+    def _restart_current_song(self):
+        pygame.mixer.music.stop()
+        try:
+            self.vocals_channel.stop()
+            self.rhythm_channel.stop()
+            for channel in self.drums_channels:
+                channel.stop()
+        except Exception:
+            pass
+        self._start_song()
+
+    def _open_exit_confirmation(self, context: str):
+        self.return_state = "paused"
+        self.confirm_context = context
+        self.confirm_index = 1
+        self.state = "confirm"
+
+    def _cancel_confirmation(self):
+        self.state = self.return_state
+
+    def _resolve_confirmation(self, accepted: bool):
+        if not accepted:
+            self._cancel_confirmation()
+            return
+        if self.confirm_context == "return_to_song_select":
+            self._exit_to_song_select()
+
+    def _go_to_main_menu(self):
+        self.state = "main_menu"
+        self.main_menu_index = 0
+        self.command_buffer = ""
+
+    def _exit_to_song_select(self):
+        pygame.mixer.music.stop()
+        try:
+            self.vocals_channel.stop()
+            self.rhythm_channel.stop()
+            for channel in self.drums_channels:
+                channel.stop()
+        except Exception:
+            pass
+        self.song_started_at = None
+        self.music_started = False
+        self.failure_started_at = None
+        self.pause_started_at = None
+        self.accumulated_pause_seconds = 0.0
+        self.state = "song_select"
+
+    def _run_calibration_flow(self):
+        if not TRACKING_SCRIPT_PATH.exists():
+            self._show_command_feedback("No encontre tracking-service/main.py")
+            return
+        self._show_command_feedback("Abriendo calibracion externa...")
+        try:
+            subprocess.run([sys.executable, str(TRACKING_SCRIPT_PATH)], cwd=str(TRACKING_SCRIPT_PATH.parent), check=False)
+        except Exception:
+            self._show_command_feedback("No pude abrir la calibracion")
+            return
+        self.state = "main_menu"
+        self._show_command_feedback("Calibracion cerrada. Regresaste al menu")
 
     def _start_song(self):
         # --- PRECARGAR AUDIO ANTES DE INICIAR EL TIEMPO ---
@@ -875,12 +1662,9 @@ class RhythmGame:
         # ¡IMPORTANTE! El tiempo se calcula ahora DESPUÉS de cargar la memoria
         self.song_started_at = (pygame.time.get_ticks() / 1000.0) + START_DELAY_SECONDS
         self.music_started = False
-        self.score = 0
-        self.combo = 0
-        self.best_combo = 0
-        self.last_hit_zone = None
-        self.last_hit_at = -999.0
-        self.last_judgement = "Comienza"
+        self.pause_started_at = None
+        self.accumulated_pause_seconds = 0.0
+        self._reset_run_stats()
 
         for note in self.notes:
             note.hit = False
@@ -901,9 +1685,12 @@ class RhythmGame:
                 channel.stop()
             except Exception:
                 pass
-        self.state = "intro"
+        self.state = "song_select"
         self.song_started_at = None
         self.music_started = False
+        self.failure_started_at = None
+        self.pause_started_at = None
+        self.accumulated_pause_seconds = 0.0
 
     def _apply_song_selection(self, index: int):
         if not self.song_library:
@@ -911,13 +1698,47 @@ class RhythmGame:
 
         self.selected_song_index = index % len(self.song_library)
         self.song_data = self.song_library[self.selected_song_index]
-        self.notes = self.song_data.notes
+        self._rebuild_notes_for_selected_difficulty()
         self.song_length = self.song_data.length_seconds
         self.cover_surface = self._load_cover_surface(self.song_data.cover_path)
         # Defer loading stems until playback to avoid blocking UI on selection
         self.vocals_sound = None
         self.rhythm_sound = None
         self.drums_sounds = []
+
+    def _set_difficulty(self, difficulty_key: str):
+        if difficulty_key not in DIFFICULTY_PROFILES:
+            return
+        self.selected_difficulty = difficulty_key
+        self._rebuild_notes_for_selected_difficulty()
+
+    def _cycle_difficulty(self, direction: int):
+        current_index = DIFFICULTY_ORDER.index(self.selected_difficulty)
+        new_index = (current_index + direction) % len(DIFFICULTY_ORDER)
+        self._set_difficulty(DIFFICULTY_ORDER[new_index])
+
+    def _rebuild_notes_for_selected_difficulty(self):
+        if self.song_data is None:
+            return
+        self.notes = self.song_loader.build_playable_notes(self.song_data.base_notes, self.selected_difficulty)
+        self.song_data.notes = self.notes
+
+    def _reset_run_stats(self):
+        self.score = 0
+        self.combo = 0
+        self.best_combo = 0
+        self.health = 0.50
+        self.display_health = self.health
+        self.miss_streak = 0
+        self.last_hit_zone = None
+        self.last_hit_at = -999.0
+        self.last_judgement = "Comienza"
+        self.failure_started_at = None
+        self.failed_message = ""
+        self.pause_started_at = None
+
+    def _current_profile(self):
+        return DIFFICULTY_PROFILES[self.selected_difficulty]
 
     def _start_music(self):
         """Inicia el audio base y los stems (vocals/rhythm/drums) sincronizados."""
@@ -945,7 +1766,7 @@ class RhythmGame:
 
     def _register_hit(self, zone: str):
         """Registra un golpe del usuario y evalúa timing/score."""
-        if self.song_started_at is None:
+        if self.song_started_at is None or self.state != "playing":
             return
 
         current_time = pygame.time.get_ticks() / 1000.0
@@ -968,15 +1789,22 @@ class RhythmGame:
 
         if candidate is None:
             self.combo = 0
-            self.last_judgement = "Muy pronto" if self._has_upcoming_note(zone, song_time) else "Fuera de tiempo"
+            has_upcoming_note = self._has_upcoming_note(zone, song_time)
+            self.last_judgement = "Muy pronto" if has_upcoming_note else "Fuera de tiempo"
+            self.miss_streak += 1
+            penalty = self._current_profile().health_loss_bad_hit * (0.75 if has_upcoming_note else 1.0)
+            self._change_health(-penalty)
             self.last_hit_zone = zone
             self.last_hit_at = current_time
+            self._check_fail_state()
             return
 
         candidate.hit = True
         candidate.judged = True
         self.combo += 1
         self.best_combo = max(self.best_combo, self.combo)
+        self.miss_streak = 0
+        self._change_health(self._current_profile().health_gain_hit)
         self.score += max(50, int(150 - (abs(candidate_offset) * 500)))
         # Ampliamos la ventana de Perfecto de 55ms a 65ms
         self.last_judgement = "Perfecto" if abs(candidate_offset) < 0.075 else "Bien"        
@@ -999,19 +1827,81 @@ class RhythmGame:
                 note.judged = True
                 note.hit = False
                 self.combo = 0
+                self.miss_streak += 1
+                self._change_health(-self._current_profile().health_loss_miss)
                 self.last_judgement = "Miss"
+                self._check_fail_state()
+                if self.state == "failed":
+                    break
+
+    def _change_health(self, delta: float):
+        self.health = max(0.0, min(1.0, self.health + delta))
+
+    def _check_fail_state(self):
+        profile = self._current_profile()
+        if self.health > 0.0 and self.miss_streak < profile.fail_streak:
+            return
+        self._trigger_fail_state()
+
+    def _trigger_fail_state(self):
+        if self.state != "playing":
+            return
+
+        self.state = "failed"
+        self.health = 0.0
+        self.failure_started_at = pygame.time.get_ticks() / 1000.0
+        if self.miss_streak >= self._current_profile().fail_streak:
+            self.failed_message = "Demasiados fallos seguidos"
+        else:
+            self.failed_message = "Te quedaste sin energia"
+        self.last_judgement = "Perdiste"
+        pygame.mixer.music.stop()
+        try:
+            self.vocals_channel.stop()
+        except Exception:
+            pass
+        try:
+            self.rhythm_channel.stop()
+        except Exception:
+            pass
+        for channel in self.drums_channels:
+            try:
+                channel.stop()
+            except Exception:
+                pass
 
     def _draw(self):
         self._draw_background()
 
-        if self.state == "intro":
-            self._draw_intro()
+        if self.state == "main_menu":
+            self._draw_main_menu()
+        elif self.state == "song_select":
+            self._draw_song_select()
         elif self.state == "playing":
             self._draw_playfield()
+        elif self.state == "paused":
+            self._draw_playfield()
+            self._draw_pause_overlay()
+        elif self.state == "pause_difficulty":
+            self._draw_playfield()
+            self._draw_pause_overlay()
+            self._draw_pause_difficulty_overlay()
+        elif self.state == "confirm":
+            if self.song_started_at is not None:
+                self._draw_playfield()
+            else:
+                self._draw_song_select()
+            self._draw_confirm_overlay()
+        elif self.state == "failed":
+            self._draw_playfield()
+            self._draw_failed_overlay()
         elif self.state == "finished":
             self._draw_playfield()
             self._draw_results()
+        elif self.state == "credits":
+            self._draw_credits()
 
+        self._draw_command_bar()
         pygame.display.flip()
 
     def _draw_background(self):
@@ -1055,36 +1945,65 @@ class RhythmGame:
         pygame.draw.rect(panel, border_color, panel.get_rect(), 2, border_radius=radius)
         self.screen.blit(panel, rect.topleft)
 
-    def _draw_intro(self):
+    def _draw_main_menu(self):
+        title = self.title_font.render("AirDrums Hero", True, HUD_TEXT)
+        subtitle = self.ui_font.render("Menu principal", True, HUD_TEXT)
+        helper = self.small_font.render("Di o escribe: Jugar, Calibrar, Creditos, Salir", True, HUD_TEXT)
+
+        header_box = pygame.Rect(0, 0, min(620, WINDOW_WIDTH - 120), 120)
+        header_box.center = (WINDOW_WIDTH // 2, 100)
+        self._draw_panel(header_box, fill_alpha=115, radius=24)
+        self.screen.blit(title, title.get_rect(center=(header_box.centerx, header_box.y + 40)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(header_box.centerx, header_box.y + 82)))
+
+        menu_box = pygame.Rect(0, 0, min(420, WINDOW_WIDTH - 180), 300)
+        menu_box.center = (WINDOW_WIDTH // 2, int(WINDOW_HEIGHT * 0.38))
+        self._draw_panel(menu_box, fill_alpha=108, radius=24)
+
+        for index, option in enumerate(self.main_menu_options):
+            option_rect = pygame.Rect(menu_box.x + 28, menu_box.y + 52 + (index * 58), menu_box.width - 56, 42)
+            if index == self.main_menu_index:
+                pygame.draw.rect(self.screen, (88, 76, 32), option_rect, border_radius=14)
+                pygame.draw.rect(self.screen, (255, 235, 130), option_rect, 2, border_radius=14)
+            option_surface = self.ui_font.render(option, True, HUD_TEXT)
+            self.screen.blit(option_surface, option_surface.get_rect(center=option_rect.center))
+
+        info_box = pygame.Rect(0, 0, min(720, WINDOW_WIDTH - 80), 60)
+        info_box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 140)
+        self._draw_panel(info_box, fill_alpha=98, radius=18)
+        self.screen.blit(helper, helper.get_rect(center=(info_box.centerx, info_box.centery)))
+
+    def _draw_song_select(self):
         title = self.title_font.render("AirDrums Hero", True, HUD_TEXT)
         subtitle = self.ui_font.render(f"{self.song_data.artist} - {self.song_data.title}", True, HUD_TEXT)
         hint = self.ui_font.render("ENTER para empezar", True, HUD_TEXT)
         source = self.small_font.render(f"Chart: {self.song_data.source_name}", True, HUD_TEXT)
         kick_text = "Usando chart PART DRUMS (bateria)"
         kick_hint = self.small_font.render(kick_text, True, HUD_TEXT)
-
-        controls = self.small_font.render(
-            "Prueba manual: A platillo, S hi-hat, D tarola, J tom sup, K tom inf, SPACE bombo",
+        difficulty_label = DIFFICULTY_PROFILES[self.selected_difficulty].label
+        difficulty_hint = self.small_font.render(
+            f"Dificultad: {difficulty_label}  |  Voz: Facil, Medio, Dificil",
             True,
             HUD_TEXT,
         )
-        udp_hint = self.small_font.render(
-            "Tambien escucha golpes reales desde middleware por UDP 127.0.0.1:5053",
+        note_count_hint = self.small_font.render(
+            f"Notas para esta dificultad: {len(self.notes)}",
             True,
             HUD_TEXT,
         )
 
-        header_box = pygame.Rect(340, 58, 580, 132)
+        selector_box = pygame.Rect(28, 252, min(300, max(240, int(WINDOW_WIDTH * 0.28))), 250)
+        content_left = selector_box.right + 28
+        content_width = max(420, WINDOW_WIDTH - content_left - 34)
+
+        header_box = pygame.Rect(content_left, 78, content_width, 112)
         self._draw_panel(header_box, fill_alpha=110, radius=24)
         self.screen.blit(title, title.get_rect(center=(header_box.centerx, header_box.y + 40)))
-        self.screen.blit(subtitle, subtitle.get_rect(center=(header_box.centerx, header_box.y + 83)))
-        self.screen.blit(source, source.get_rect(center=(header_box.centerx, header_box.y + 112)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(header_box.centerx, header_box.y + 74)))
+        self.screen.blit(source, source.get_rect(center=(header_box.centerx, header_box.y + 98)))
 
-        preview_rect = pygame.Rect(0, 0, 760, 300)
-        preview_rect.center = (WINDOW_WIDTH // 2 + 150, 372)
+        preview_rect = pygame.Rect(content_left, 236, content_width, 290)
         self._draw_highway(preview_rect, preview_time=16.0, show_song_banner=False)
-
-        selector_box = pygame.Rect(66, 274, 360, 260)
         self._draw_panel(selector_box)
 
         selector_title = self.ui_font.render("Canciones", True, HUD_TEXT)
@@ -1104,20 +2023,26 @@ class RhythmGame:
             text_surface = self.tiny_font.render(text[:40], True, HUD_TEXT)
             self.screen.blit(text_surface, (selector_box.x + 20, item_y))
 
-        footer_box = pygame.Rect(220, 540, 840, 150)
+        footer_box = pygame.Rect(28, WINDOW_HEIGHT - 186, WINDOW_WIDTH - 56, 118)
         self._draw_panel(footer_box, fill_alpha=105, radius=20)
         self.screen.blit(hint, hint.get_rect(center=(footer_box.centerx, footer_box.y + 28)))
         nav_hint = self.small_font.render("Flechas arriba/abajo para elegir cancion", True, HUD_TEXT)
-        self.screen.blit(nav_hint, nav_hint.get_rect(center=(footer_box.centerx, footer_box.y + 58)))
-        self.screen.blit(kick_hint, kick_hint.get_rect(center=(footer_box.centerx, footer_box.y + 80)))
-        self.screen.blit(controls, controls.get_rect(center=(footer_box.centerx, footer_box.y + 108)))
-        self.screen.blit(udp_hint, udp_hint.get_rect(center=(footer_box.centerx, footer_box.y + 132)))
+        self.screen.blit(nav_hint, nav_hint.get_rect(center=(footer_box.centerx, footer_box.y + 56)))
+        self.screen.blit(difficulty_hint, difficulty_hint.get_rect(center=(footer_box.centerx, footer_box.y + 80)))
+        compact_info = self.small_font.render(
+            f"Notas: {len(self.notes)}  |  Voz: siguiente, atras, volver, facil, medio, dificil",
+            True,
+            HUD_TEXT,
+        )
+        self.screen.blit(compact_info, compact_info.get_rect(center=(footer_box.centerx, footer_box.y + 102)))
 
     def _draw_playfield(self):
-        highway_rect = pygame.Rect(0, 0, 900, 570)
-        highway_rect.center = (WINDOW_WIDTH // 2 + 30, 408)
+        highway_width = min(900, max(760, int(WINDOW_WIDTH * 0.86)))
+        highway_height = min(570, max(500, int(WINDOW_HEIGHT * 0.60)))
+        highway_rect = pygame.Rect(0, 0, highway_width, highway_height)
+        highway_rect.center = (WINDOW_WIDTH // 2 + 8, int(WINDOW_HEIGHT * 0.43))
         self._draw_highway(highway_rect, self._current_song_time(), show_song_banner=True)
-        self._draw_hud()
+        self._draw_hud(highway_rect)
 
     def _draw_results(self):
         overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
@@ -1139,28 +2064,191 @@ class RhythmGame:
         self.screen.blit(combo, combo.get_rect(center=(box.centerx, box.y + 155)))
         self.screen.blit(hint, hint.get_rect(center=(box.centerx, box.y + 193)))
 
-    def _draw_hud(self):
-        left_panel = pygame.Rect(18, 18, 245, 180)
+    def _draw_failed_overlay(self):
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((20, 0, 0, 148))
+        self.screen.blit(overlay, (0, 0))
+
+        box = pygame.Rect(0, 0, 540, 240)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)
+        pygame.draw.rect(self.screen, (28, 10, 10), box, border_radius=22)
+        pygame.draw.rect(self.screen, (255, 90, 90), box, 3, border_radius=22)
+
+        title = self.title_font.render("Perdiste", True, (255, 228, 228))
+        reason = self.ui_font.render(self.failed_message, True, (255, 176, 176))
+        combo = self.ui_font.render(f"Mejor combo: {self.best_combo}", True, HUD_TEXT)
+        hint = self.small_font.render("ENTER para volver al inicio", True, HUD_TEXT)
+
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 56)))
+        self.screen.blit(reason, reason.get_rect(center=(box.centerx, box.y + 112)))
+        self.screen.blit(combo, combo.get_rect(center=(box.centerx, box.y + 156)))
+        self.screen.blit(hint, hint.get_rect(center=(box.centerx, box.y + 196)))
+
+    def _draw_pause_overlay(self):
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 120))
+        self.screen.blit(overlay, (0, 0))
+
+        box = pygame.Rect(0, 0, 420, 290)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)
+        self._draw_panel(box, border_color=(255, 230, 120), fill_alpha=145, radius=22)
+
+        title = self.title_font.render("Menu", True, HUD_TEXT)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 38)))
+
+        for index, option in enumerate(self.pause_menu_options):
+            option_rect = pygame.Rect(box.x + 32, box.y + 80 + (index * 46), box.width - 64, 36)
+            if index == self.pause_menu_index:
+                pygame.draw.rect(self.screen, (88, 76, 32), option_rect, border_radius=12)
+            option_surface = self.ui_font.render(option, True, HUD_TEXT)
+            self.screen.blit(option_surface, option_surface.get_rect(center=option_rect.center))
+
+    def _draw_pause_difficulty_overlay(self):
+        box = pygame.Rect(0, 0, 320, 238)
+        box.center = (WINDOW_WIDTH // 2 + 250, WINDOW_HEIGHT // 2)
+        self._draw_panel(box, border_color=(180, 220, 255), fill_alpha=150, radius=18)
+        title = self.ui_font.render("Cambiar nivel", True, HUD_TEXT)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 28)))
+
+        for index, option in enumerate(self.pause_difficulty_options):
+            option_rect = pygame.Rect(box.x + 22, box.y + 60 + (index * 40), box.width - 44, 30)
+            if index == self.pause_difficulty_index:
+                pygame.draw.rect(self.screen, (42, 66, 92), option_rect, border_radius=10)
+            option_surface = self.small_font.render(option, True, HUD_TEXT)
+            self.screen.blit(option_surface, option_surface.get_rect(center=option_rect.center))
+
+    def _draw_confirm_overlay(self):
+        box = pygame.Rect(0, 0, 380, 180)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 120)
+        self._draw_panel(box, border_color=(255, 180, 120), fill_alpha=152, radius=18)
+        title = self.ui_font.render("Estas seguro?", True, HUD_TEXT)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 42)))
+
+        for index, option in enumerate(self.confirm_options):
+            option_rect = pygame.Rect(box.x + 54 + (index * 140), box.y + 92, 90, 40)
+            if index == self.confirm_index:
+                pygame.draw.rect(self.screen, (92, 60, 32), option_rect, border_radius=12)
+            option_surface = self.ui_font.render(option, True, HUD_TEXT)
+            self.screen.blit(option_surface, option_surface.get_rect(center=option_rect.center))
+
+    def _draw_credits(self):
+        title = self.title_font.render("Creditos", True, HUD_TEXT)
+        box = pygame.Rect(0, 0, 760, 360)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 30)
+        self._draw_panel(box, fill_alpha=120, radius=24)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 46)))
+
+        for index, line in enumerate(CREDIT_LINES):
+            surface = self.ui_font.render(line[:56], True, HUD_TEXT)
+            self.screen.blit(surface, surface.get_rect(center=(box.centerx, box.y + 112 + (index * 48))))
+
+        hint = self.small_font.render("Di o escribe volver para regresar al menu principal", True, HUD_TEXT)
+        self.screen.blit(hint, hint.get_rect(center=(box.centerx, box.bottom - 34)))
+
+    def _draw_command_bar(self):
+        if not self._supports_command_input():
+            return
+
+        bar_rect = pygame.Rect(24, WINDOW_HEIGHT - 54, WINDOW_WIDTH - 48, 34)
+        self._draw_panel(bar_rect, fill_alpha=112, radius=18)
+
+        prompt = self.small_font.render(f"Comandos ({self.voice_backend_name}):", True, HUD_TEXT)
+        command_text = self.tiny_font.render(self.command_buffer or "...", True, HUD_TEXT)
+        feedback = self.tiny_font.render(self.command_feedback[:120], True, HUD_TEXT)
+
+        self.screen.blit(prompt, (bar_rect.x + 12, bar_rect.y + 3))
+        self.screen.blit(command_text, (bar_rect.x + 190, bar_rect.y + 5))
+        self.screen.blit(feedback, (bar_rect.x + 12, bar_rect.y + 18))
+
+    def _draw_hud(self, highway_rect: pygame.Rect):
+        left_panel = pygame.Rect(18, 18, 248, 220)
         self._draw_panel(left_panel, fill_alpha=110, radius=20)
 
         score_surface = self.ui_font.render(f"Score {self.score}", True, HUD_TEXT)
         combo_surface = self.ui_font.render(f"Combo x{self.combo}", True, HUD_TEXT)
+        difficulty_surface = self.small_font.render(
+            f"Dificultad: {DIFFICULTY_PROFILES[self.selected_difficulty].label}",
+            True,
+            HUD_TEXT,
+        )
         artist_surface = self.small_font.render(self.song_data.artist, True, HUD_TEXT)
         song_surface = self.small_font.render(self.song_data.title, True, HUD_TEXT)
 
         judgement_color = HUD_TEXT if self.last_judgement != "Miss" else MISS_TEXT
         judgement_surface = self.ui_font.render(self.last_judgement, True, judgement_color)
+        streak_color = MISS_TEXT if self.miss_streak >= max(1, self._current_profile().fail_streak - 2) else HUD_TEXT
+        streak_surface = self.small_font.render(f"Fallos seguidos: {self.miss_streak}", True, streak_color)
 
         self.screen.blit(score_surface, (32, 32))
         self.screen.blit(combo_surface, (32, 66))
         self.screen.blit(judgement_surface, (32, 104))
-        self.screen.blit(song_surface, (32, 145))
-        self.screen.blit(artist_surface, (32, 167))
+        self.screen.blit(difficulty_surface, (32, 142))
+        self.screen.blit(streak_surface, (32, 164))
+        self.screen.blit(song_surface, (32, 186))
+        self.screen.blit(artist_surface, (32, 208))
 
-        bottom_panel = pygame.Rect(915, 674, 340, 30)
+        self._draw_health_meter(highway_rect)
+
+        bottom_panel = pygame.Rect(max(18, WINDOW_WIDTH - 320), WINDOW_HEIGHT - 118, 300, 30)
         self._draw_panel(bottom_panel, fill_alpha=96, radius=14)
         port_surface = self.small_font.render("Recibiendo golpes UDP 5053", True, HUD_TEXT)
-        self.screen.blit(port_surface, (930, 680))
+        self.screen.blit(port_surface, (bottom_panel.x + 12, bottom_panel.y + 6))
+
+    def _draw_health_meter(self, highway_rect: pygame.Rect):
+        meter_height = min(250, max(190, int(highway_rect.height * 0.42)))
+        shell_rect = pygame.Rect(12, 270, 42, meter_height)
+        shell_points = [
+            (shell_rect.x + 12, shell_rect.y),
+            (shell_rect.right, shell_rect.y + 10),
+            (shell_rect.right, shell_rect.bottom - 8),
+            (shell_rect.x + 5, shell_rect.bottom),
+            (shell_rect.x, shell_rect.bottom - 12),
+            (shell_rect.x, shell_rect.y + 10),
+        ]
+        shadow = pygame.Surface((shell_rect.width + 22, shell_rect.height + 22), pygame.SRCALPHA)
+        shifted_points = [(x - shell_rect.x + 11, y - shell_rect.y + 11) for x, y in shell_points]
+        pygame.draw.polygon(shadow, (0, 0, 0, 85), shifted_points)
+        self.screen.blit(shadow, (shell_rect.x - 11, shell_rect.y + 8))
+
+        pygame.draw.polygon(self.screen, (26, 28, 32), shell_points)
+        pygame.draw.polygon(self.screen, (230, 230, 230), shell_points, 3)
+
+        meter_rect = pygame.Rect(shell_rect.x + 10, shell_rect.y + 16, 16, shell_rect.height - 30)
+
+        color_sections = [
+            ((70, 210, 110), 0.0, 0.34),
+            ((240, 202, 72), 0.34, 0.68),
+            ((224, 66, 66), 0.68, 1.0),
+        ]
+        for color, start_ratio, end_ratio in color_sections:
+            top = meter_rect.y + int(meter_rect.height * start_ratio)
+            height = max(1, int(meter_rect.height * (end_ratio - start_ratio)))
+            pygame.draw.rect(self.screen, color, pygame.Rect(meter_rect.x, top, meter_rect.width, height))
+
+        fill_height = int(meter_rect.height * self.display_health)
+        empty_height = meter_rect.height - fill_height
+        if empty_height > 0:
+            empty_rect = pygame.Rect(meter_rect.x, meter_rect.y, meter_rect.width, empty_height)
+            pygame.draw.rect(self.screen, (14, 14, 18), empty_rect)
+
+        pygame.draw.rect(self.screen, (245, 240, 228), meter_rect, 2)
+        glow_height = max(8, min(meter_rect.height, fill_height))
+        glow_rect = pygame.Rect(meter_rect.x - 8, meter_rect.bottom - glow_height, meter_rect.width + 16, glow_height)
+        glow = pygame.Surface((glow_rect.width, glow_rect.height), pygame.SRCALPHA)
+        pygame.draw.rect(glow, (255, 245, 205, 42), glow.get_rect())
+        self.screen.blit(glow, glow_rect.topleft)
+
+        marker_y = meter_rect.bottom - int(meter_rect.height * self.display_health)
+        pygame.draw.line(
+            self.screen,
+            (255, 255, 255),
+            (meter_rect.x - 4, marker_y),
+            (meter_rect.right + 4, marker_y),
+            3,
+        )
+
+        label = self.small_font.render("Vida", True, HUD_TEXT)
+        self.screen.blit(label, label.get_rect(center=(shell_rect.centerx + 2, shell_rect.y - 14)))
 
     def _draw_highway(self, rect: pygame.Rect, preview_time: float, show_song_banner: bool):
         top_width = rect.width * 0.36
@@ -1170,6 +2258,13 @@ class RhythmGame:
         bottom_y = rect.bottom - 86
         strike_y = rect.bottom - 100 # Antes: - 130
         kick_y = rect.bottom - 100   # Antes: - 58 (ahora son iguales)
+
+        failure_progress = 0.0
+        if self.state == "failed" and self.failure_started_at is not None:
+            elapsed = (pygame.time.get_ticks() / 1000.0) - self.failure_started_at
+            failure_progress = max(0.0, min(1.0, elapsed / 1.2))
+            shake = math.sin(elapsed * 38.0) * (18 * (1.0 - failure_progress))
+            top_center_x += shake
 
         left_top = (top_center_x - (top_width / 2), top_y)
         right_top = (top_center_x + (top_width / 2), top_y)
@@ -1191,6 +2286,29 @@ class RhythmGame:
 
         pygame.draw.polygon(self.screen, HIGHWAY_FILL, [left_top, right_top, right_bottom, left_bottom])
         pygame.draw.polygon(self.screen, HIGHWAY_EDGE, [left_top, right_top, right_bottom, left_bottom], 4)
+
+        if failure_progress > 0.0:
+            crack_overlay = pygame.Surface((rect.width + 30, rect.height + 20), pygame.SRCALPHA)
+            crack_alpha = int(140 * failure_progress)
+            crack_lines = [
+                ((60, 120), (220, 240), (160, 340), (310, 490)),
+                ((rect.width - 100, 80), (rect.width - 210, 240), (rect.width - 160, 360), (rect.width - 280, 510)),
+                ((rect.width // 2, 40), (rect.width // 2 - 40, 190), (rect.width // 2 + 25, 330), (rect.width // 2 - 18, 500)),
+            ]
+            for line_points in crack_lines:
+                pygame.draw.lines(crack_overlay, (255, 230, 230, crack_alpha), False, line_points, 3)
+                for point in line_points[1:-1]:
+                    branch = [point, (point[0] + 28, point[1] + 26)]
+                    pygame.draw.lines(crack_overlay, (255, 130, 130, crack_alpha), False, branch, 2)
+            self.screen.blit(crack_overlay, (rect.x - 15, rect.y - 10))
+
+            danger_overlay = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+            pygame.draw.polygon(
+                danger_overlay,
+                (255, 40, 40, int(58 * failure_progress)),
+                [(0, 0), (rect.width, 0), (rect.width, rect.height), (0, rect.height)],
+            )
+            self.screen.blit(danger_overlay, rect.topleft)
 
         for lane_index, color in enumerate(LANE_COLORS):
             left_ratio = lane_index / 5
@@ -1242,7 +2360,7 @@ class RhythmGame:
             pygame.draw.circle(self.screen, color, (int(lane_x), int(strike_y)), radius, 5)
 
         kick_pressed = self._was_recent_zone_hit("bombo")
-        active_kick_color = (250, 250, 250) if kick_pressed else (185, 185, 185)
+        active_kick_color = KICK_COLOR_PRESSED if kick_pressed else KICK_COLOR
         pygame.draw.line(self.screen, active_kick_color, kick_left, kick_right, 12)
 
         for note in self.notes:
@@ -1290,7 +2408,10 @@ class RhythmGame:
             pygame.draw.circle(self.screen, (240, 240, 240), (int(lane_x), int(y)), radius, 3)
 
         if show_song_banner:
-            top_label_panel = pygame.Rect(rect.x + 120, rect.y - 64, 520, 54)
+            banner_width = min(rect.width - 180, WINDOW_WIDTH - 360)
+            top_label_panel = pygame.Rect(0, 0, banner_width, 54)
+            top_label_panel.centerx = rect.centerx
+            top_label_panel.y = max(58, rect.y - 76)
             self._draw_panel(top_label_panel, fill_alpha=102, radius=16)
             song_label = self.ui_font.render(f"{self.song_data.artist} - {self.song_data.title}", True, HUD_TEXT)
             legend = self.small_font.render(
@@ -1304,8 +2425,10 @@ class RhythmGame:
     def _current_song_time(self):
         if self.song_started_at is None:
             return 0.0
-        # Cambiar el return agregando la resta del offset:
-        return (pygame.time.get_ticks() / 1000.0) - self.song_started_at - GLOBAL_OFFSET_SECONDS
+        paused_time = self.accumulated_pause_seconds
+        if self.pause_started_at is not None:
+            paused_time += (pygame.time.get_ticks() / 1000.0) - self.pause_started_at
+        return (pygame.time.get_ticks() / 1000.0) - self.song_started_at - paused_time - GLOBAL_OFFSET_SECONDS
 
     def _lane_center_x(self, left_top, left_bottom, right_top, right_bottom, y, lane_index):
         progress = self._vertical_progress(left_top[1], left_bottom[1], y)

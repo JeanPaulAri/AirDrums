@@ -252,6 +252,7 @@ class VoiceCommandListener:
         self.microphone = None
         self.executor = None
         self.recognition_future = None
+        self.last_file_mtime = 0.0
 
     def start(self):
         if self._start_python_microphone():
@@ -373,8 +374,26 @@ class VoiceCommandListener:
         if not self.available or not self.output_path.exists():
             return None
 
+        # --- NUEVO CÓDIGO (Optimización de I/O de disco) ---
+        try:
+            # Obtener el tiempo de modificación del archivo sin abrirlo
+            current_mtime = os.stat(self.output_path).st_mtime
+            
+            # Si el archivo no ha sido modificado desde la última vez que lo leímos, salimos temprano
+            if current_mtime == self.last_file_mtime:
+                return None
+        except OSError:
+            return None
+            
+        # Si llegamos aquí, el archivo fue modificado recientemente, así que podemos leerlo de forma segura
+        # ---------------------------------------------------
+
         try:
             payload = json.loads(self.output_path.read_text(encoding="utf-8-sig"))
+            # --- NUEVO CÓDIGO ---
+            # Guardamos el tiempo de modificación después de una lectura exitosa
+            self.last_file_mtime = current_mtime
+            # --------------------
         except (OSError, json.JSONDecodeError):
             return None
 
@@ -1067,7 +1086,7 @@ class RhythmGame:
     """Loop principal del juego: input, lógica, dibujo y audio."""
     def __init__(self):
         # Pre-inicializar el mixer con un búfer bajo (512) para eliminar el retraso de audio
-        pygame.mixer.pre_init(44100, -16, 2, 512)
+        pygame.mixer.pre_init(48000, -16, 2, 512)
         pygame.init()
         pygame.mixer.init()
         pygame.mixer.set_num_channels(8)
@@ -1092,6 +1111,25 @@ class RhythmGame:
         
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption(APP_TITLE)
+
+        # === SUPERFICIES PRE-CALCULABLES CREADAS EN EL INIT ===
+        
+        # Sombra resplandeciente del fondo (Glow surface)
+        self.glow_surface = pygame.Surface((WINDOW_WIDTH + 80, WINDOW_HEIGHT + 110), pygame.SRCALPHA)
+        
+        # Superficie base transparente usada para clonar otras si hace falta
+        self.blank_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        self.crack_overlay = None  # Se pre-creará sólo si falla la partida
+        self.danger_overlay = None # Se pre-creará sólo si falla la partida
+        
+        # Resplandor en la zona de meta donde das los golpes (strike glow)
+        self.strike_glow = pygame.Surface((WINDOW_WIDTH + 20, 26), pygame.SRCALPHA)
+        pygame.draw.rect(self.strike_glow, (255, 248, 212, 90), self.strike_glow.get_rect(), border_radius=10)
+        
+        # Inicializando un caché para no re-crear la sombra redonda de cada nota (shadow_surface)
+        # Esto guarda texturas de la sombra y tamaño por cada color
+        self.note_shadow_surfaces = {}
+
         self.clock = pygame.time.Clock()
         self.song_loader = SongLoader()
 
@@ -1135,8 +1173,7 @@ class RhythmGame:
         self.confirm_options = ["Si", "No"]
         self.confirm_index = 1
         self.confirm_context = "return_to_pause"
-        self.voice_listener = VoiceCommandListener(VOICE_LISTENER_SCRIPT_PATH, VOICE_COMMAND_PATH)
-        self.voice_listener.start()
+        self.voice_listener = None
         self.voice_backend_name = self._detect_voice_backend_name()
 
         self.score = 0
@@ -1325,10 +1362,11 @@ class RhythmGame:
             self.command_feedback_until = 0.0
             self.command_feedback = "Escribe un comando y presiona ENTER"
 
-        voice_command = self.voice_listener.poll_command()
-        if voice_command:
-            self._submit_command(voice_command)
-            self._show_command_feedback(f"Voz: {voice_command}")
+        if self.voice_listener is not None:
+            voice_command = self.voice_listener.poll_command()
+            if voice_command:
+                self._submit_command(voice_command)
+                self._show_command_feedback(f"Voz: {voice_command}")
 
         if self.state == "playing":
             if self.song_started_at is not None and current_time >= self.song_started_at and not self.music_started:
@@ -1635,6 +1673,12 @@ class RhythmGame:
 
     def _start_song(self):
         # --- PRECARGAR AUDIO ANTES DE INICIAR EL TIEMPO ---
+        # Guardar estos textos estáticos como imágenes en la memoria
+        self.cached_song_label = self.ui_font.render(f"{self.song_data.artist} - {self.song_data.title}", True, HUD_TEXT)
+        self.cached_legend_label = self.small_font.render(
+            "Platillo | Hi-Hat | Tarola | Tom superior | Tom inferior | Bombo", 
+            True, HUD_TEXT
+        )
         if self.song_data.audio_path is not None:
             pygame.mixer.music.load(str(self.song_data.audio_path))
             
@@ -2271,9 +2315,9 @@ class RhythmGame:
         left_bottom = (rect.centerx - (bottom_width / 2), bottom_y)
         right_bottom = (rect.centerx + (bottom_width / 2), bottom_y)
 
-        glow_surface = pygame.Surface((rect.width + 80, rect.height + 110), pygame.SRCALPHA)
+        self.glow_surface.fill((0, 0, 0, 0)) 
         pygame.draw.polygon(
-            glow_surface,
+            self.glow_surface,
             (255, 190, 90, 28),
             [
                 (40 + left_top[0] - rect.x, 30 + left_top[1] - rect.y),
@@ -2282,13 +2326,18 @@ class RhythmGame:
                 (40 + left_bottom[0] - rect.x, 30 + left_bottom[1] - rect.y),
             ],
         )
-        self.screen.blit(glow_surface, (rect.x - 40, rect.y - 30))
+        self.screen.blit(self.glow_surface, (rect.x - 40, rect.y - 30))
 
+        # Pinta la carretera negra principal
         pygame.draw.polygon(self.screen, HIGHWAY_FILL, [left_top, right_top, right_bottom, left_bottom])
         pygame.draw.polygon(self.screen, HIGHWAY_EDGE, [left_top, right_top, right_bottom, left_bottom], 4)
 
         if failure_progress > 0.0:
-            crack_overlay = pygame.Surface((rect.width + 30, rect.height + 20), pygame.SRCALPHA)
+            if self.crack_overlay is None:
+                self.crack_overlay = pygame.Surface((rect.width + 30, rect.height + 20), pygame.SRCALPHA)
+            else:
+                self.crack_overlay.fill((0, 0, 0, 0))
+                
             crack_alpha = int(140 * failure_progress)
             crack_lines = [
                 ((60, 120), (220, 240), (160, 340), (310, 490)),
@@ -2296,19 +2345,27 @@ class RhythmGame:
                 ((rect.width // 2, 40), (rect.width // 2 - 40, 190), (rect.width // 2 + 25, 330), (rect.width // 2 - 18, 500)),
             ]
             for line_points in crack_lines:
-                pygame.draw.lines(crack_overlay, (255, 230, 230, crack_alpha), False, line_points, 3)
+                pygame.draw.lines(self.crack_overlay, (255, 230, 230, crack_alpha), False, line_points, 3)
                 for point in line_points[1:-1]:
                     branch = [point, (point[0] + 28, point[1] + 26)]
-                    pygame.draw.lines(crack_overlay, (255, 130, 130, crack_alpha), False, branch, 2)
-            self.screen.blit(crack_overlay, (rect.x - 15, rect.y - 10))
+                    pygame.draw.lines(self.crack_overlay, (255, 130, 130, crack_alpha), False, branch, 2)
+            self.screen.blit(self.crack_overlay, (rect.x - 15, rect.y - 10))
 
-            danger_overlay = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+            if self.danger_overlay is None:
+                 self.danger_overlay = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+                 
+            self.danger_overlay.fill((0, 0, 0, 0))
             pygame.draw.polygon(
-                danger_overlay,
+                self.danger_overlay,
                 (255, 40, 40, int(58 * failure_progress)),
                 [(0, 0), (rect.width, 0), (rect.width, rect.height), (0, rect.height)],
             )
-            self.screen.blit(danger_overlay, rect.topleft)
+            self.screen.blit(self.danger_overlay, rect.topleft)
+
+        # 2. Las sub-superficies para los carriles han sido reemplazadas por llamadas 
+        #    a dibujados directos en pantalla mediante un Surface preexistente o usando gfxdraw/draw si es posible.
+        #    Pintaremos una Surface compartida
+        self.blank_surface.fill((0, 0, 0, 0))
 
         for lane_index, color in enumerate(LANE_COLORS):
             left_ratio = lane_index / 5
@@ -2319,10 +2376,10 @@ class RhythmGame:
                 self._point_between(left_bottom, right_bottom, right_ratio),
                 self._point_between(left_bottom, right_bottom, left_ratio),
             ]
-            lane_surface = pygame.Surface((rect.width + 40, rect.height + 40), pygame.SRCALPHA)
-            shifted = [(20 + point[0] - rect.x, 20 + point[1] - rect.y) for point in lane_poly]
-            pygame.draw.polygon(lane_surface, (*color, 18), shifted)
-            self.screen.blit(lane_surface, (rect.x - 20, rect.y - 20))
+            shifted = [(point[0] - rect.x, point[1] - rect.y) for point in lane_poly]
+            pygame.draw.polygon(self.blank_surface, (*color, 18), shifted)
+            
+        self.screen.blit(self.blank_surface, (rect.x, rect.y))
 
         for grid_index in range(11):
             progress = grid_index / 10
@@ -2341,9 +2398,9 @@ class RhythmGame:
 
         strike_left = self._point_on_width(left_top, left_bottom, right_top, right_bottom, strike_y, 0.0)
         strike_right = self._point_on_width(left_top, left_bottom, right_top, right_bottom, strike_y, 1.0)
-        strike_glow = pygame.Surface((rect.width + 20, 26), pygame.SRCALPHA)
-        pygame.draw.rect(strike_glow, (255, 248, 212, 90), strike_glow.get_rect(), border_radius=10)
-        self.screen.blit(strike_glow, (strike_left[0] - 10, strike_y - 10))
+        
+        # 3. Utilizar el 'strike glow' pre-calculado del INIT
+        self.screen.blit(self.strike_glow, (strike_left[0] - 10, strike_y - 10))
         pygame.draw.line(self.screen, (235, 235, 235), strike_left, strike_right, 4)
 
         kick_left = self._point_on_width(left_top, left_bottom, right_top, right_bottom, kick_y, 0.0)
@@ -2355,7 +2412,6 @@ class RhythmGame:
             radius = 28
             is_pressed = self._was_recent_zone_hit(self._lane_zone(lane_index))
             fill = color if is_pressed else (28, 28, 28)
-            # Se eliminó el + 42 para alinear perfectamente con el bombo y la zona de hit
             pygame.draw.circle(self.screen, fill, (int(lane_x), int(strike_y)), radius)
             pygame.draw.circle(self.screen, color, (int(lane_x), int(strike_y)), radius, 5)
 
@@ -2368,8 +2424,11 @@ class RhythmGame:
                 continue
 
             time_until_hit = note.time - preview_time
-            if time_until_hit < -LATE_HIT_WINDOW_SECONDS or time_until_hit > PREVIEW_LEAD_SECONDS:
-                continue
+            if time_until_hit < -LATE_HIT_WINDOW_SECONDS:
+                continue  # La nota ya pasó, saltamos a revisar la otra
+                
+            if time_until_hit > PREVIEW_LEAD_SECONDS:
+                break 
 
             progress = 1.0 - (time_until_hit / PREVIEW_LEAD_SECONDS)
             progress = max(0.0, min(1.0, progress))
@@ -2395,15 +2454,25 @@ class RhythmGame:
             radius = max(12, int(12 + (progress * 18)))
             color = LANE_COLORS[lane_index]
             fill = color if not note.hit else (255, 246, 185)
-            shadow_radius = radius + 6
-            shadow_surface = pygame.Surface((shadow_radius * 2 + 8, shadow_radius * 2 + 8), pygame.SRCALPHA)
-            pygame.draw.circle(
-                shadow_surface,
-                (*color, 45),
-                (shadow_radius + 4, shadow_radius + 4),
-                shadow_radius,
-            )
-            self.screen.blit(shadow_surface, (int(lane_x) - shadow_radius - 4, int(y) - shadow_radius - 4))
+            
+            # --- 4. OPTIMIZACIÓN DE SOMBRA CLONADA DE NOTA
+            # Buscar en la cache si ya dibujamos una sombra en la memoria de este exacto tamaño y color
+            cache_key = (color, radius)
+            if cache_key not in self.note_shadow_surfaces:
+                shadow_radius = radius + 6
+                shadow_surface = pygame.Surface((shadow_radius * 2 + 8, shadow_radius * 2 + 8), pygame.SRCALPHA)
+                pygame.draw.circle(
+                    shadow_surface,
+                    (*color, 45),
+                    (shadow_radius + 4, shadow_radius + 4),
+                    shadow_radius,
+                )
+                self.note_shadow_surfaces[cache_key] = (shadow_surface, shadow_radius)
+                
+            shadow_surface_cached, shadow_radius_cached = self.note_shadow_surfaces[cache_key]
+            
+            self.screen.blit(shadow_surface_cached, (int(lane_x) - shadow_radius_cached - 4, int(y) - shadow_radius_cached - 4))
+            # ---------------------------------------------
             pygame.draw.circle(self.screen, fill, (int(lane_x), int(y)), radius)
             pygame.draw.circle(self.screen, (240, 240, 240), (int(lane_x), int(y)), radius, 3)
 
@@ -2413,21 +2482,19 @@ class RhythmGame:
             top_label_panel.centerx = rect.centerx
             top_label_panel.y = max(58, rect.y - 76)
             self._draw_panel(top_label_panel, fill_alpha=102, radius=16)
-            song_label = self.ui_font.render(f"{self.song_data.artist} - {self.song_data.title}", True, HUD_TEXT)
-            legend = self.small_font.render(
-                "Platillo | Hi-Hat | Tarola | Tom superior | Tom inferior | Bombo",
-                True,
-                HUD_TEXT,
-            )
-            self.screen.blit(song_label, (top_label_panel.x + 16, top_label_panel.y + 6))
-            self.screen.blit(legend, (top_label_panel.x + 16, top_label_panel.y + 30))
+            self.screen.blit(self.cached_song_label, (top_label_panel.x + 16, top_label_panel.y + 6))
+            self.screen.blit(self.cached_legend_label, (top_label_panel.x + 16, top_label_panel.y + 30))
 
     def _current_song_time(self):
         if self.song_started_at is None:
             return 0.0
+
+        # Calculamos cuánto tiempo ha pasado en total, restándole el tiempo que el juego ha estado en pausa
         paused_time = self.accumulated_pause_seconds
         if self.pause_started_at is not None:
             paused_time += (pygame.time.get_ticks() / 1000.0) - self.pause_started_at
+
+        # El reloj de tu PC (get_ticks) no sufre desincronización
         return (pygame.time.get_ticks() / 1000.0) - self.song_started_at - paused_time - GLOBAL_OFFSET_SECONDS
 
     def _lane_center_x(self, left_top, left_bottom, right_top, right_bottom, y, lane_index):

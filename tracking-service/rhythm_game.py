@@ -30,6 +30,10 @@ UDP_HOST = "127.0.0.1"
 UDP_PORT = 5053
 UDP_BUFFER_SIZE = 2048
 
+# Entrada de comandos de voz desde voice_listener.py por UDP.
+VOICE_UDP_HOST = "127.0.0.1"
+VOICE_UDP_PORT = 5054
+
 # Título y carpeta base de canciones.
 APP_TITLE = "AirDrums Rhythm Highway"
 SONGS_DIR = Path(__file__).resolve().parent / "assets" / "songs"
@@ -153,6 +157,34 @@ class SongData:
     length_seconds: float
     source_name: str
     inferred_kick: bool
+
+
+class UdpVoiceReceiver:
+    """Recibe comandos de voz desde voice_listener.py por UDP."""
+    def __init__(self, host: str, port: int):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind((host, port))
+        self.socket.setblocking(False)
+
+    def poll_commands(self):
+        """Retorna lista de comandos de voz recibidos."""
+        commands = []
+        while True:
+            try:
+                data, _ = self.socket.recvfrom(UDP_BUFFER_SIZE)
+            except BlockingIOError:
+                break
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            command = payload.get("command")
+            if command:
+                commands.append(command)
+        return commands
+
+    def close(self):
+        self.socket.close()
 
 
 @dataclass(frozen=True)
@@ -1101,6 +1133,7 @@ class RhythmGame:
         self.tiny_font = pygame.font.SysFont("arial", 16)
 
         self.receiver = UdpHitReceiver(UDP_HOST, UDP_PORT)
+        self.voice_receiver = UdpVoiceReceiver(VOICE_UDP_HOST, VOICE_UDP_PORT)
         self.song_library = self.song_loader.load_all_songs()
         self.selected_song_index = 0
         self.selected_difficulty = "easy"
@@ -1174,7 +1207,7 @@ class RhythmGame:
                 self._draw()
         finally:
             pygame.mixer.music.stop()
-            self.voice_listener.stop()
+            self.voice_receiver.close()
             self.receiver.close()
             pygame.quit()
 
@@ -1325,8 +1358,7 @@ class RhythmGame:
             self.command_feedback_until = 0.0
             self.command_feedback = "Escribe un comando y presiona ENTER"
 
-        voice_command = self.voice_listener.poll_command()
-        if voice_command:
+        for voice_command in self.voice_receiver.poll_commands():
             self._submit_command(voice_command)
             self._show_command_feedback(f"Voz: {voice_command}")
 

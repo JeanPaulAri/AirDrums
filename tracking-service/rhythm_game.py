@@ -39,8 +39,7 @@ VOICE_COMMAND_PATH = Path(__file__).resolve().parent / "_voice_command.json"
 CREDIT_LINES = [
     "AirDrums",
     "Proyecto universitario de interaccion humano-computador",
-    "Equipo creador: actualiza estos nombres en CREDIT_LINES",
-    "Apoyo tecnico: Codex",
+    "Equipo creador: actualiza estos nombres en team dinamita",
 ]
 
 # Paleta de colores UI.

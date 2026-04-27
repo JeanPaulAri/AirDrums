@@ -2,6 +2,7 @@ import sys
 import time
 import subprocess
 from pathlib import Path
+import socket 
 
 from PySide6.QtCore import Qt, QTimer, QObject, QEvent
 from PySide6.QtWidgets import (
@@ -30,6 +31,10 @@ PYTHON_EXE = sys.executable
 
 MIDDLEWARE_SCRIPT = BASE_DIR / "middleware.py"
 TRACKING_SCRIPT = BASE_DIR / "main.py"
+
+GAME_SCRIPT = BASE_DIR / "game.py"
+CALIBRACION_SCRIPT = BASE_DIR / "calibracion.py"
+
 RHYTHM_SCRIPT = BASE_DIR / "rhythm_game.py"
 VOICE_LISTENER_SCRIPT = BASE_DIR / "voice_listener.py"
 
@@ -101,6 +106,9 @@ def enum_visible_windows():
 
 def text_matches_hints(text, hints):
     text = (text or "").lower()
+    ignorar = ["visual studio", "code", "panel de control", "macrowindow", "explorador"]
+    if any(palabra in text for palabra in ignorar):
+        return False
     return any(hint.lower() in text for hint in hints)
 
 
@@ -404,17 +412,18 @@ class AirDrumsMacroWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("AirDrums MacroWindow")
+        self.setWindowTitle("Panel de Control Principal")
         self.resize(1600, 900)
 
         self.processes = {
             "middleware": None,
-            "tracking": None,
+            "game": None,          # Cambiado de "tracking" a "game"
             "unity": None,
             "rhythm": None,
             "voice_listener": None,
+            "calibracion": None,   # Nuevo proceso
         }
-
+        self.is_calibrating = False 
         self.active_panel = None
         self.active_panel_name = "ninguno"
 
@@ -434,6 +443,7 @@ class AirDrumsMacroWindow(QMainWindow):
         self.control_opencv_button = QPushButton("Control OpenCV")
         self.control_unity_button = QPushButton("Control Unity")
         self.control_rhythm_button = QPushButton("Control Rhythm")
+        self.calibrar_button = QPushButton("Calibrar Batería")
 
         self.start_button = QPushButton("Iniciar todo")
         self.relayout_button = QPushButton("Reubicar")
@@ -448,7 +458,7 @@ class AirDrumsMacroWindow(QMainWindow):
         self.control_rhythm_button.clicked.connect(
             lambda: self.set_active_panel(self.rhythm_panel, "Rhythm Game")
         )
-
+        self.calibrar_button.clicked.connect(self.start_calibration)
         self.start_button.clicked.connect(self.start_all)
         self.relayout_button.clicked.connect(self.try_embed_windows)
         self.stop_button.clicked.connect(self.stop_all)
@@ -461,7 +471,35 @@ class AirDrumsMacroWindow(QMainWindow):
         self.fit_timer = QTimer()
         self.fit_timer.timeout.connect(self.fit_all)
         self.fit_timer.start(500)
+        self.monitor_timer = QTimer()
+        self.monitor_timer.timeout.connect(self.monitor_state)
+        self.monitor_timer.start(1000)
 
+        # --- NUEVO: CONFIGURACIÓN UDP PARA ESCUCHAR A RHYTHM_GAME ---
+        self.cmd_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cmd_socket.bind(("127.0.0.1", 5055))
+        self.cmd_socket.setblocking(False)
+
+        self.cmd_timer = QTimer()
+        self.cmd_timer.timeout.connect(self.poll_commands)
+        self.cmd_timer.start(100)  # Revisar cada 100ms
+
+    def poll_commands(self):
+        """Lee mensajes UDP no bloqueantes enviados por otros scripts."""
+        try:
+            while True:
+                data, _ = self.cmd_socket.recvfrom(1024)
+                command = data.decode("utf-8").strip()
+                if command == "START_CALIBRATION":
+                    print("¡Mensaje UDP recibido! Iniciando calibración remota...")
+                    # Ejecuta sólo si no está ya calibrando
+                    if not self.is_calibrating:
+                        self.start_calibration()
+        except BlockingIOError:
+            pass # No hay mensajes nuevos
+        except Exception as e:
+            print(f"Error de Socket: {e}")
+            
     def build_ui(self):
         root = QWidget()
         root.setStyleSheet("background-color: #050505;")
@@ -483,9 +521,9 @@ class AirDrumsMacroWindow(QMainWindow):
         """)
 
         for button in [
-            self.control_opencv_button,
             self.control_unity_button,
             self.control_rhythm_button,
+            self.calibrar_button,
             self.start_button,
             self.relayout_button,
             self.stop_button,
@@ -499,7 +537,7 @@ class AirDrumsMacroWindow(QMainWindow):
         header.addWidget(self.control_opencv_button)
         header.addWidget(self.control_unity_button)
         header.addWidget(self.control_rhythm_button)
-
+        header.addWidget(self.calibrar_button)
         header.addWidget(self.start_button)
         header.addWidget(self.relayout_button)
         header.addWidget(self.stop_button)
@@ -510,11 +548,11 @@ class AirDrumsMacroWindow(QMainWindow):
         left_column = QVBoxLayout()
         left_column.setSpacing(8)
 
-        left_column.addWidget(self.opencv_panel, stretch=1)
-        left_column.addWidget(self.unity_panel, stretch=1)
+        main_layout.addWidget(self.unity_panel, stretch=1)
+        main_layout.addWidget(self.rhythm_panel, stretch=1)
 
-        main_layout.addLayout(left_column, stretch=1)
-        main_layout.addWidget(self.rhythm_panel, stretch=2)
+        # Ocultamos explícitamente el panel de OpenCV para que no reaccione en la UI
+        self.opencv_panel.hide()
 
         root_layout.addLayout(header)
         root_layout.addLayout(main_layout, stretch=1)
@@ -589,8 +627,8 @@ class AirDrumsMacroWindow(QMainWindow):
             self.processes["middleware"] = self.launch_python_script(MIDDLEWARE_SCRIPT)
             time.sleep(0.5)
 
-        if self.processes["tracking"] is None:
-            self.processes["tracking"] = self.launch_python_script(TRACKING_SCRIPT)
+        if self.processes["game"] is None:
+            self.processes["game"] = self.launch_python_script(GAME_SCRIPT)
             time.sleep(1.0)
 
         if self.processes["unity"] is None:
@@ -608,47 +646,94 @@ class AirDrumsMacroWindow(QMainWindow):
         self.set_status("Procesos iniciados. Buscando ventanas...")
         self.embed_timer.start(700)
 
+    def kill_process(self, name):
+        """Cierra un proceso específico limpiamente."""
+        process = self.processes.get(name)
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        self.processes[name] = None
+
+    def start_calibration(self):
+        """Mata Unity y Game, e inicia la calibración inyectándola en el panel."""
+        self.set_status("Iniciando calibración...")
+        self.is_calibrating = True
+        
+        self.kill_process("unity")
+        self.kill_process("game")
+        
+        # Preparar el panel de Unity para recibir OpenCV
+        self.unity_panel.embedded_hwnd = None
+        self.unity_panel.placeholder.setText("CALIBRANDO...")
+        self.unity_panel.placeholder.show()
+
+        # Lanzar calibración
+        self.processes["calibracion"] = self.launch_python_script(CALIBRACION_SCRIPT)
+        
+        self.embed_timer.start(700) # Enciende el emparejador de ventanas
+
+    def monitor_state(self):
+        """Revisa constantemente si el script de calibración se cerró solo."""
+        if self.is_calibrating:
+            cal_proc = self.processes.get("calibracion")
+            # Si el proceso existe pero poll() ya no es None, significa que terminó
+            if cal_proc and cal_proc.poll() is not None:
+                self.set_status("Calibración terminada. Reiniciando entorno...")
+                self.is_calibrating = False
+                self.processes["calibracion"] = None
+                
+                # Desvincular ventana y preparar panel
+                self.unity_panel.embedded_hwnd = None
+                self.unity_panel.placeholder.setText("AIRDRUMS / UNITY")
+                self.unity_panel.placeholder.show()
+                
+                # Volver a lanzar Unity y el Tracker 
+                self.processes["game"] = self.launch_python_script(GAME_SCRIPT)
+                time.sleep(1.0)
+                self.processes["unity"] = self.launch_unity(UNITY_EXE)
+                
+                self.embed_timer.start(700)
+
     def try_embed_windows(self):
         changed = False
 
-        tracking_process = self.processes.get("tracking")
-        unity_process = self.processes.get("unity")
         rhythm_process = self.processes.get("rhythm")
 
-        # OpenCV
-        if self.opencv_panel.embedded_hwnd is None:
-            hwnd = find_window_for_process_or_global(
-                tracking_process,
-                OPENCV_TITLE_HINTS,
-            )
+        # --- Lógica dinámica del Panel Central (Unity o Calibración) ---
+        if self.is_calibrating:
+            cal_process = self.processes.get("calibracion")
+            if self.unity_panel.embedded_hwnd is None:
+                hwnd = find_window_for_process_or_global(cal_process, OPENCV_TITLE_HINTS)
+                if hwnd:
+                    self.unity_panel.set_embedded_window(hwnd)
+                    changed = True
+        else:
+            unity_process = self.processes.get("unity")
+            if self.unity_panel.embedded_hwnd is None:
+                hwnd = find_window_for_process_or_global(unity_process, UNITY_TITLE_HINTS)
+                if hwnd:
+                    self.unity_panel.set_embedded_window(hwnd)
+                    changed = True
 
-            if hwnd:
-                self.opencv_panel.set_embedded_window(hwnd)
-                changed = True
-
-        # Unity / AirDrums
-        if self.unity_panel.embedded_hwnd is None:
-            hwnd = find_window_for_process_or_global(
-                unity_process,
-                UNITY_TITLE_HINTS,
-            )
-
-            if hwnd:
-                self.unity_panel.set_embedded_window(hwnd)
-                changed = True
-
-        # Rhythm Game
+        # --- Rhythm Game ---
         if self.rhythm_panel.embedded_hwnd is None:
-            hwnd = find_window_for_process_or_global(
-                rhythm_process,
-                RHYTHM_TITLE_HINTS,
-            )
-
+            hwnd = find_window_for_process_or_global(rhythm_process, RHYTHM_TITLE_HINTS)
             if hwnd:
                 self.rhythm_panel.set_embedded_window(hwnd)
                 changed = True
 
-        hide_window_by_hints(MASK_TITLE_HINTS)
+        # --- Ocultar ventanas auxiliares ---
+        hide_window_by_hints(MASK_TITLE_HINTS) # Oculta la máscara
+        if not self.is_calibrating:
+            # Si NO estamos calibrando, el juego general arrojará una ventana en game.py que no queremos ver
+            hide_window_by_hints(OPENCV_TITLE_HINTS) 
+
         self.fit_all()
 
         all_ready = (

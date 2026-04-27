@@ -1653,17 +1653,18 @@ class RhythmGame:
         self.state = "song_select"
 
     def _run_calibration_flow(self):
-        if not TRACKING_SCRIPT_PATH.exists():
-            self._show_command_feedback("No encontre tracking-service/main.py")
-            return
-        self._show_command_feedback("Abriendo calibracion externa...")
+        self._show_command_feedback("Enviando señal de calibracion...")
+        
         try:
-            subprocess.run([sys.executable, str(TRACKING_SCRIPT_PATH)], cwd=str(TRACKING_SCRIPT_PATH.parent), check=False)
+            # Enviamos el disparador a la MacroWindow en el puerto 5055
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(b"START_CALIBRATION", ("127.0.0.1", 5055))
+            sock.close()
         except Exception:
-            self._show_command_feedback("No pude abrir la calibracion")
+            self._show_command_feedback("Error al pedir la calibracion")
             return
+            
         self.state = "main_menu"
-        self._show_command_feedback("Calibracion cerrada. Regresaste al menu")
 
     def _start_song(self):
         # --- PRECARGAR AUDIO ANTES DE INICIAR EL TIEMPO ---

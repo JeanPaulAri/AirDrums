@@ -1,8 +1,35 @@
 param(
-    [string]$OutputPath
+    [string]$OutputPath,
+    [string]$Host = "127.0.0.1",
+    [int]$Port = 5054
 )
 
 Add-Type -AssemblyName System.Speech
+
+function Send-VoiceCommand {
+    param(
+        [string]$Text,
+        [double]$Confidence
+    )
+
+    $payload = @{
+        command = $Text
+        confidence = [math]::Round($Confidence, 3)
+        timestamp = [DateTime]::UtcNow.ToString("o")
+    } | ConvertTo-Json -Compress
+
+    $client = New-Object System.Net.Sockets.UdpClient
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        [void]$client.Send($bytes, $bytes.Length, $Host, $Port)
+    } finally {
+        $client.Dispose()
+    }
+
+    if ($OutputPath) {
+        Set-Content -LiteralPath $OutputPath -Value $payload -Encoding UTF8
+    }
+}
 
 $commands = @(
     "jugar",
@@ -12,7 +39,11 @@ $commands = @(
     "siguiente",
     "atras",
     "volver",
+    "tutorial",
+    "repetir",
+    "regresar",
     "menu",
+    "pausa",
     "continuar",
     "reiniciar",
     "cambiar nivel",
@@ -53,13 +84,7 @@ Register-ObjectEvent -InputObject $engine -EventName SpeechRecognized -Action {
         return
     }
 
-    $payload = @{
-        command = $text
-        confidence = [math]::Round($confidence, 3)
-        timestamp = [DateTime]::UtcNow.ToString("o")
-    } | ConvertTo-Json -Compress
-
-    Set-Content -LiteralPath $OutputPath -Value $payload -Encoding UTF8
+    Send-VoiceCommand -Text $text -Confidence $confidence
 } | Out-Null
 
 $engine.RecognizeAsync([System.Speech.Recognition.RecognizeMode]::Multiple)

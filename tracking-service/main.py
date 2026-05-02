@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import pygame
 import os
+import time # <- Asegúrate de que esta línea esté también arriba de tu archivo general.
 
 import socket  # NUEVO: Para la comunicación UDP
 import json    # NUEVO: Para estructurar los mensajes
@@ -18,7 +19,7 @@ def obtener_centro_global(mask):
     if contornos:
         # Quedarnos con la mancha de color más grande
         c_max = max(contornos, key=cv2.contourArea)
-        if cv2.contourArea(c_max) > 500: # Ignorar manchas muy pequeñas
+        if cv2.contourArea(c_max) > 50: # Ignorar manchas muy pequeñas
             M = cv2.moments(c_max)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
@@ -58,13 +59,20 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 # Azul
 # Rosa basado en RGB(254, 169, 204)
 # Rango para atrapar tonos rosados/magenta con variaciones de luz
-lower_red = np.array([90, 200, 200])
-upper_red = np.array([110, 255, 255])
+lower_red = np.array([119, 150, 150])
+upper_red = np.array([139, 255, 255])
+
+# Rojo / rosado limpio
+lower_red1 = np.array([0, 85, 150])
+upper_red1 = np.array([10, 255, 255])
+
+lower_red2 = np.array([170, 85, 150])
+upper_red2 = np.array([179, 255, 255])
 
 # Verde basado en RGB(1, 189, 37)
 # Rango para atrapar este verde intenso y sus sombras
-lower_green = np.array([55, 100, 50])
-upper_green = np.array([85, 255, 255])
+lower_green = np.array([75, 50, 120])
+upper_green = np.array([100, 255, 255])
 
 # --- Rangos de Colores en HSV ---
 # ROJO (LED de alta luminosidad)
@@ -136,8 +144,10 @@ while True:
     frame = cv2.flip(frame, 1)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # 1. Crear máscaras para Rojo y Verde
-    mask_red = cv2.inRange(hsv, lower_red, upper_red)
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+    mask_red = mask1 + mask2
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
     
     # Filtro morfológico
@@ -236,7 +246,6 @@ while True:
         break
 
 # Bucle de posicionamiento de la persona
-import time # <- Asegúrate de que esta línea esté también arriba de tu archivo general.
 
 pads_init = {
     # Base
@@ -299,7 +308,10 @@ while True:
     frame = cv2.flip(frame, 1)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    mask_red = cv2.inRange(hsv, lower_red, upper_red)
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+    mask_red = mask1 + mask2
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
     
     kernel = np.ones((5,5), np.uint8)
@@ -379,12 +391,12 @@ while True:
         progreso = int((indice_actual / len(secuencia_objetivo)) * 100)
         cv2.putText(frame, f"Progreso: {progreso}%", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
     else:
-        tiempo_restante = 5 - int(time.time() - tiempo_inicio_espera)
+        tiempo_restante = 3 - int(time.time() - tiempo_inicio_espera)
         cv2.putText(frame, "¡Excelente, mantente asi!", (80, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 3)
         cv2.putText(frame, f"Comenzando en {tiempo_restante}...", (160, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
         cv2.putText(frame, "Toca cualquier pad para volver a posicionarte", (30, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,165,255), 2)
         
-        if time.time() - tiempo_inicio_espera >= 5:
+        if time.time() - tiempo_inicio_espera >= 3:
             # Pasa el tiempo de espera, se rompe el bucle de calibración 
             break
     
@@ -432,8 +444,10 @@ while indice_elemento < len(elementos_a_ubicar):
     frame = cv2.flip(frame, 1)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # La baqueta que usamos como puntero (En tu código está como rojo/azul y verde)
-    mask_green = cv2.inRange(hsv, lower_red, upper_red)
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+    mask_green = mask1 + mask2
     mask_red = cv2.inRange(hsv, lower_green, upper_green)
     
     kernel = np.ones((5,5), np.uint8)
@@ -479,7 +493,7 @@ while indice_elemento < len(elementos_a_ubicar):
                         tiempo_inicio_fijacion = time.time()
                     
                     tiempo_transcurrido = time.time() - tiempo_inicio_fijacion
-                    tiempo_restante = 5 - int(tiempo_transcurrido)
+                    tiempo_restante = 3 - int(tiempo_transcurrido)
                     
                     # Cuadrado AMARILLO: Relleno transparente + Borde sólido
                     cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 255), cv2.FILLED)
@@ -488,7 +502,7 @@ while indice_elemento < len(elementos_a_ubicar):
                     
                     cv2.putText(frame, f"FIJANDO... {tiempo_restante}s", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-                    if tiempo_transcurrido >= 5:
+                    if tiempo_transcurrido >= 3:
                         # Si llega a cero, guardamos en memoria y pasamos al siguiente
                         pads_game[celda] = (cx, cy, ancho, alto)
                         indice_elemento += 1
@@ -563,8 +577,10 @@ mensaje_calibracion = {
 }
 
 # Enviamos el paquete por UDP
-sock.sendto(json.dumps(mensaje_calibracion).encode('utf-8'), (UDP_IP, UDP_PORT))
-
+try:
+    sock.sendto(json.dumps(mensaje_calibracion).encode('utf-8'), (UDP_IP, UDP_PORT))
+except Exception:
+    pass
 # == Preparar variables para el Bucle Jugable Final ==
 # Esto sobreescribe los 'ovales' estáticos iniciales en favor de los que el usuario construyó.
 ovales = {}
@@ -605,9 +621,12 @@ while True:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     # 1. Crear máscaras (Asumimos que configuraste lower_blue y upper_blue para tu pie)
-    mask_red = cv2.inRange(hsv, lower_red, upper_red)
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+    mask_red = mask1 + mask2
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
-    mask_pie = cv2.inRange(hsv, lower_red, upper_red) # NUEVO COLOR PARA EL PIE
+    mask_pie = cv2.inRange(hsv, lower_green, upper_green) # NUEVO COLOR PARA EL PIE
     
     # Filtro morfológico
     kernel = np.ones((5,5), np.uint8)
@@ -655,7 +674,10 @@ while True:
     }
 
     # Enviar a Pygame
-    sock.sendto(json.dumps(mensaje_posiciones).encode('utf-8'), (UDP_IP, UDP_PORT))
+    try:
+        sock.sendto(json.dumps(mensaje_posiciones).encode('utf-8'), (UDP_IP, UDP_PORT))
+    except Exception:
+        pass
     # =================================================================
 
     # =================================================================
@@ -674,9 +696,9 @@ while True:
         cv2.putText(frame, "Mano V", (centro_verde[0] + 10, centro_verde[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
     if centro_pie:
-        # Dibuja una 'X' color Azul
-        cv2.drawMarker(frame, (centro_pie[0], centro_pie[1]), (255, 0, 0), cv2.MARKER_TILTED_CROSS, 20, 3)
-        cv2.putText(frame, "Pie", (centro_pie[0] + 10, centro_pie[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        # Dibuja una 'X' color Rojo para el pie
+        cv2.drawMarker(frame, (centro_pie[0], centro_pie[1]), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 3)
+        cv2.putText(frame, "Pie", (centro_pie[0] + 10, centro_pie[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
     # =================================================================
 
     # Recorrer cada cuadrado
@@ -712,7 +734,7 @@ while True:
         porcentaje_green = cv2.countNonZero(roi_green) / area_total
 
         # --- Lógica del Switch para el ROSA ---
-        if porcentaje_red > 0.005:
+        if porcentaje_red > 0.01:
             if not estado_red[celda]:
                 estado_red[celda] = True
                 if sonidos[celda]: 
@@ -723,9 +745,11 @@ while True:
                     "tipo": "golpe",
                     "pad": str(celda) # Convertimos la tupla (0,1) a string "(0, 1)" para JSON
                 }
-                sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
-
-        elif porcentaje_red < 0.005:
+                try:
+                    sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
+                except Exception:
+                    pass
+        elif porcentaje_red < 0.05:
             estado_red[celda] = False
 
         # --- Lógica del Switch para el VERDE ---
@@ -740,8 +764,10 @@ while True:
                     "tipo": "golpe",
                     "pad": str(celda)
                 }
-                sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
-
+                try:
+                    sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
+                except Exception:
+                    pass
         elif porcentaje_green < 0.005:
             estado_verde[celda] = False
 
@@ -775,7 +801,7 @@ while True:
     cv2.putText(frame, "Bateria Virtual", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
 
     cv2.imshow('Deteccion de Bateria', frame)
-    cv2.imshow('Mascara Combinada (IA)', mask_combinada)
+    #cv2.imshow('Mascara Combinada (IA)', mask_combinada)
 
     tecla = cv2.waitKey(1) & 0xFF
 
@@ -796,8 +822,10 @@ while True:
             "pad": str(celda_manual),
             "color": "teclado" # Un identificador útil para saber que fue manual
         }
-        sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
-        
+        try:
+            sock.sendto(json.dumps(mensaje_golpe).encode('utf-8'), (UDP_IP, UDP_PORT))
+        except Exception:
+            pass
         # Un pequeño aviso en consola para que sepas que funcionó
         print(f"Prueba manual: Pad {celda_manual} activado con el teclado.")
 

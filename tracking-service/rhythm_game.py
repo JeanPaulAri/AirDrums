@@ -42,8 +42,7 @@ VOICE_LISTENER_PS1_PATH = Path(__file__).resolve().parent / "voice_listener.ps1"
 CREDIT_LINES = [
     "AirDrums",
     "Proyecto universitario de interaccion humano-computador",
-    "Equipo creador: actualiza estos nombres en CREDIT_LINES",
-    "Apoyo tecnico: Codex",
+    "Equipo creador: actualiza estos nombres en EQUIPO DINAMITA",
 ]
 
 # Paleta de colores UI.

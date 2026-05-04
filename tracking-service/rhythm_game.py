@@ -1,11 +1,10 @@
-"""Juego rítmico de batería (Drum Hero) con lectura de charts MIDI y playback de stems.
+"""Juego ritmico de bateria (Drum Hero) con lectura de charts MIDI y playback de stems.
 
 Este módulo carga canciones desde assets/songs, interpreta PART DRUMS del MIDI
 y sincroniza audio (song/vocals/rhythm/drums_1..4) con el gameplay.
 """
 
 import configparser
-import concurrent.futures
 import importlib.util
 import json
 import math
@@ -30,16 +29,20 @@ UDP_HOST = "127.0.0.1"
 UDP_PORT = 5053
 UDP_BUFFER_SIZE = 2048
 
+# Entrada de comandos de voz desde voice_listener.py por UDP.
+VOICE_UDP_HOST = "127.0.0.1"
+VOICE_UDP_PORT = 5054
+
 # Título y carpeta base de canciones.
 APP_TITLE = "AirDrums Rhythm Highway"
 SONGS_DIR = Path(__file__).resolve().parent / "assets" / "songs"
 TRACKING_SCRIPT_PATH = Path(__file__).resolve().parent / "main.py"
-VOICE_LISTENER_SCRIPT_PATH = Path(__file__).resolve().parent / "voice_listener.ps1"
-VOICE_COMMAND_PATH = Path(__file__).resolve().parent / "_voice_command.json"
+VOICE_LISTENER_PY_PATH = Path(__file__).resolve().parent / "voice_listener.py"
+VOICE_LISTENER_PS1_PATH = Path(__file__).resolve().parent / "voice_listener.ps1"
 CREDIT_LINES = [
     "AirDrums",
     "Proyecto universitario de interaccion humano-computador",
-    "Equipo creador: actualiza estos nombres en team dinamita",
+    "Equipo creador: actualiza estos nombres en EQUIPO DINAMITA",
 ]
 
 # Paleta de colores UI.
@@ -152,6 +155,35 @@ class SongData:
     length_seconds: float
     source_name: str
     inferred_kick: bool
+    metadata: dict[str, str] | None = None
+
+
+class UdpVoiceReceiver:
+    """Recibe comandos de voz desde voice_listener.py por UDP."""
+    def __init__(self, host: str, port: int):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind((host, port))
+        self.socket.setblocking(False)
+
+    def poll_commands(self):
+        """Retorna lista de comandos de voz recibidos."""
+        commands = []
+        while True:
+            try:
+                data, _ = self.socket.recvfrom(UDP_BUFFER_SIZE)
+            except BlockingIOError:
+                break
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            command = payload.get("command")
+            if command:
+                commands.append(command)
+        return commands
+
+    def close(self):
+        self.socket.close()
 
 
 @dataclass(frozen=True)
@@ -234,106 +266,49 @@ DIFFICULTY_PROFILES = {
 }
 
 
-class VoiceCommandListener:
-    """Escucha comandos de voz con libreria Python y usa Windows como respaldo."""
-    def __init__(self, script_path: Path, output_path: Path):
-        self.script_path = script_path
-        self.output_path = output_path
+class ExternalVoiceProcess:
+    """Lanza la escucha de voz en un proceso aparte para evitar lag en el juego."""
+    def __init__(self, python_script_path: Path, powershell_script_path: Path):
+        self.python_script_path = python_script_path
+        self.powershell_script_path = powershell_script_path
         self.process = None
-        self.last_timestamp = None
         self.available = False
-        self.status_message = "Voz no inicializada"
         self.backend_name = "Ninguno"
-        self.pending_commands = deque()
-        self.pending_audio = deque(maxlen=1)
-        self.stop_listening = None
-        self.recognizer = None
-        self.microphone = None
-        self.executor = None
-        self.recognition_future = None
-        self.last_file_mtime = 0.0
+        self.status_message = "Voz no inicializada"
 
     def start(self):
-        if self._start_python_microphone():
+        if self._start_python_listener():
             return
         self._start_windows_fallback()
 
-    def _start_python_microphone(self):
-        if importlib.util.find_spec("speech_recognition") is None or importlib.util.find_spec("pyaudio") is None:
+    def _start_python_listener(self):
+        has_speech = importlib.util.find_spec("speech_recognition") is not None
+        has_audio = importlib.util.find_spec("pyaudio") is not None
+        if not (has_speech and has_audio and self.python_script_path.exists()):
             return False
 
+        command = [sys.executable, str(self.python_script_path)]
         try:
-            import speech_recognition as sr
-
-            self.recognizer = sr.Recognizer()
-            self.recognizer.dynamic_energy_threshold = True
-            self.recognizer.energy_threshold = 250
-            self.recognizer.pause_threshold = 0.35
-            self.recognizer.non_speaking_duration = 0.18
-            self.recognizer.operation_timeout = 2.0
-            self.microphone = sr.Microphone()
-            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            with self.microphone as source:
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            self.stop_listening = self.recognizer.listen_in_background(
-                self.microphone,
-                self._python_callback,
-                phrase_time_limit=1.5,
+            self.process = subprocess.Popen(
+                command,
+                cwd=str(self.python_script_path.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             self.available = True
-            self.backend_name = "Microfono Python"
-            self.status_message = "Voz lista con SpeechRecognition"
+            self.backend_name = "Microfono externo (Python)"
+            self.status_message = "Voz externa lista"
             return True
-        except Exception as exc:
-            self.available = False
-            self.backend_name = "Ninguno"
-            self.status_message = f"No pude iniciar SpeechRecognition: {exc}"
+        except OSError:
+            self.process = None
             return False
 
-    def _python_callback(self, recognizer, audio):
-        if self.pending_audio.maxlen and len(self.pending_audio) >= self.pending_audio.maxlen:
-            self.pending_audio.clear()
-        self.pending_audio.append(audio)
-
-    def _recognize_audio(self, audio):
-        recognized_text = None
-        try:
-            recognized_text = self.recognizer.recognize_google(audio, language="es-ES")
-        except Exception:
-            try:
-                recognized_text = self.recognizer.recognize_google(audio, language="es-MX")
-            except Exception:
-                try:
-                    recognized_text = self.recognizer.recognize_sphinx(audio)
-                except Exception:
-                    recognized_text = None
-        return recognized_text
-
-    def _poll_python_command(self):
-        if self.recognition_future is not None and self.recognition_future.done():
-            try:
-                recognized_text = self.recognition_future.result()
-            except Exception:
-                recognized_text = None
-            self.recognition_future = None
-            if recognized_text:
-                self.pending_commands.append(recognized_text)
-
-        if self.recognition_future is None and self.pending_audio and self.executor is not None:
-            next_audio = self.pending_audio.popleft()
-            self.recognition_future = self.executor.submit(self._recognize_audio, next_audio)
-
     def _start_windows_fallback(self):
-        if not self.script_path.exists():
-            self.status_message = "No encontre el listener de voz"
+        if not self.powershell_script_path.exists():
+            self.available = False
             self.backend_name = "Ninguno"
+            self.status_message = "No encontre listener de voz externo"
             return
-
-        try:
-            if self.output_path.exists():
-                self.output_path.unlink()
-        except OSError:
-            pass
 
         command = [
             "powershell",
@@ -341,82 +316,30 @@ class VoiceCommandListener:
             "-ExecutionPolicy",
             "Bypass",
             "-File",
-            str(self.script_path),
-            "-OutputPath",
-            str(self.output_path),
+            str(self.powershell_script_path),
         ]
         try:
             self.process = subprocess.Popen(
                 command,
-                cwd=str(self.script_path.parent),
+                cwd=str(self.powershell_script_path.parent),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             self.available = True
-            self.backend_name = "Microfono Windows"
-            self.status_message = "Voz lista"
+            self.backend_name = "Microfono externo (Windows)"
+            self.status_message = "Voz externa lista"
         except OSError:
             self.process = None
             self.available = False
             self.backend_name = "Ninguno"
-            self.status_message = "No pude iniciar voz de Windows"
+            self.status_message = "No pude iniciar voz externa"
 
-    def poll_command(self):
-        if self.backend_name == "Microfono Python":
-            self._poll_python_command()
-        if self.pending_commands:
-            return self.pending_commands.popleft()
+    def refresh_status(self):
         if self.process is not None and self.process.poll() is not None:
             self.available = False
-            self.status_message = "El listener de voz se cerro"
-            return None
-        if not self.available or not self.output_path.exists():
-            return None
-
-        # --- NUEVO CÓDIGO (Optimización de I/O de disco) ---
-        try:
-            # Obtener el tiempo de modificación del archivo sin abrirlo
-            current_mtime = os.stat(self.output_path).st_mtime
-            
-            # Si el archivo no ha sido modificado desde la última vez que lo leímos, salimos temprano
-            if current_mtime == self.last_file_mtime:
-                return None
-        except OSError:
-            return None
-            
-        # Si llegamos aquí, el archivo fue modificado recientemente, así que podemos leerlo de forma segura
-        # ---------------------------------------------------
-
-        try:
-            payload = json.loads(self.output_path.read_text(encoding="utf-8-sig"))
-            # --- NUEVO CÓDIGO ---
-            # Guardamos el tiempo de modificación después de una lectura exitosa
-            self.last_file_mtime = current_mtime
-            # --------------------
-        except (OSError, json.JSONDecodeError):
-            return None
-
-        timestamp = payload.get("timestamp")
-        if not timestamp or timestamp == self.last_timestamp:
-            return None
-
-        self.last_timestamp = timestamp
-        return payload.get("command")
+            self.status_message = "El listener de voz externo se cerro"
 
     def stop(self):
-        if self.stop_listening is not None:
-            try:
-                self.stop_listening(wait_for_stop=False)
-            except Exception:
-                pass
-        self.stop_listening = None
-        if self.executor is not None:
-            try:
-                self.executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        self.executor = None
-        self.recognition_future = None
         if self.process is not None:
             try:
                 self.process.terminate()
@@ -424,11 +347,6 @@ class VoiceCommandListener:
             except Exception:
                 pass
         self.process = None
-        try:
-            if self.output_path.exists():
-                self.output_path.unlink()
-        except OSError:
-            pass
 
 
 class UdpHitReceiver:
@@ -486,7 +404,11 @@ class SongLoader:
         """Lee metadata, paths de audio y notes.mid; valida PART DRUMS."""
         song_ini_path = folder / "song.ini"
         midi_path = folder / "notes.mid"
-        audio_path = folder / "song.ogg"
+        audio_path = None
+        for candidate in (folder / "song.ogg", folder / "song.wav"):
+            if candidate.exists():
+                audio_path = candidate
+                break
         cover_path = folder / "album.png"
         vocals_path = folder / "vocals.ogg"
         rhythm_path = folder / "rhythm.ogg"
@@ -512,7 +434,7 @@ class SongLoader:
             artist=metadata.get("artist", "Desconocido"),
             album=metadata.get("album", ""),
             charter=metadata.get("charter", ""),
-            audio_path=audio_path if audio_path.exists() else None,
+            audio_path=audio_path,
             cover_path=cover_path if cover_path.exists() else None,
             vocals_path=vocals_path if vocals_path.exists() else None,
             rhythm_path=rhythm_path if rhythm_path.exists() else None,
@@ -522,6 +444,7 @@ class SongLoader:
             length_seconds=max(chart_length, float(metadata.get("song_length", "0")) / 1000.0),
             source_name=source_name,
             inferred_kick=inferred_kick,
+            metadata=metadata,
         )
 
     def _read_song_ini(self, song_ini_path: Path):
@@ -1031,6 +954,7 @@ class SongLoader:
             length_seconds=max(note.time for note in notes) + 4.0,
             source_name="DEMO",
             inferred_kick=False,
+            metadata={},
         )
 
 
@@ -1138,6 +1062,7 @@ class RhythmGame:
         self.tiny_font = pygame.font.SysFont("arial", 16)
 
         self.receiver = UdpHitReceiver(UDP_HOST, UDP_PORT)
+        self.voice_receiver = UdpVoiceReceiver(VOICE_UDP_HOST, VOICE_UDP_PORT)
         self.song_library = self.song_loader.load_all_songs()
         self.selected_song_index = 0
         self.selected_difficulty = "easy"
@@ -1163,7 +1088,7 @@ class RhythmGame:
         self.command_buffer = ""
         self.command_feedback = "Escribe un comando y presiona ENTER"
         self.command_feedback_until = 0.0
-        self.main_menu_options = ["Jugar", "Calibrar", "Creditos", "Salir"]
+        self.main_menu_options = ["Jugar", "Tutorial", "Calibrar", "Creditos", "Salir"]
         self.main_menu_index = 0
         self.pause_menu_options = ["Continuar", "Reiniciar", "Cambiar nivel", "Salir"]
         self.pause_menu_index = 0
@@ -1172,8 +1097,12 @@ class RhythmGame:
         self.confirm_options = ["Si", "No"]
         self.confirm_index = 1
         self.confirm_context = "return_to_pause"
-        self.voice_listener = None
+        self.voice_listener = ExternalVoiceProcess(VOICE_LISTENER_PY_PATH, VOICE_LISTENER_PS1_PATH)
+        self.voice_listener.start()
         self.voice_backend_name = self._detect_voice_backend_name()
+        self.note_speed_options = {"lento": 0.8, "normal": 1.0, "rapido": 1.25}
+        self.note_speed_label = "normal"
+        self.last_voice_heard = "Sin voz detectada aun"
 
         self.score = 0
         self.combo = 0
@@ -1194,10 +1123,6 @@ class RhythmGame:
     def _detect_voice_backend_name(self):
         if getattr(self, "voice_listener", None) is not None and self.voice_listener.available:
             return self.voice_listener.backend_name
-        has_speech = importlib.util.find_spec("speech_recognition") is not None
-        has_audio = importlib.util.find_spec("pyaudio") is not None
-        if has_speech and has_audio:
-            return "Microfono"
         return "Texto (micro no configurado)"
 
     def run(self):
@@ -1210,7 +1135,11 @@ class RhythmGame:
                 self._draw()
         finally:
             pygame.mixer.music.stop()
-            self.voice_listener.stop()
+            try:
+                self.voice_listener.stop()
+            except Exception:
+                pass
+            self.voice_receiver.close()
             self.receiver.close()
             pygame.quit()
 
@@ -1362,10 +1291,12 @@ class RhythmGame:
             self.command_feedback = "Escribe un comando y presiona ENTER"
 
         if self.voice_listener is not None:
-            voice_command = self.voice_listener.poll_command()
-            if voice_command:
-                self._submit_command(voice_command)
-                self._show_command_feedback(f"Voz: {voice_command}")
+            self.voice_listener.refresh_status()
+
+        for voice_command in self.voice_receiver.poll_commands():
+            self.last_voice_heard = voice_command
+            self._submit_command(voice_command)
+            self._show_command_feedback(f"Voz: {voice_command}")
 
         if self.state == "playing":
             if self.song_started_at is not None and current_time >= self.song_started_at and not self.music_started:
@@ -1407,8 +1338,45 @@ class RhythmGame:
         self.command_feedback = message
         self.command_feedback_until = (pygame.time.get_ticks() / 1000.0) + duration
 
+    def _extract_command(self, command: str):
+        known_commands = [
+            "cambiar nivel",
+            "creditos del juego",
+            "calibracion",
+            "continuar",
+            "reiniciar",
+            "siguiente",
+            "regresar",
+            "tutorial",
+            "calibrar",
+            "creditos",
+            "dificil",
+            "facil",
+            "medio",
+            "normal",
+            "volver",
+            "menu",
+            "pausa",
+            "parar",
+            "detener",
+            "jugar",
+            "salir",
+            "repetir",
+            "atras",
+            "si",
+            "no",
+            "lento",
+            "rapido",
+        ]
+        if command in known_commands:
+            return command
+        for known in sorted(known_commands, key=len, reverse=True):
+            if known in command:
+                return known
+        return command
+
     def _submit_command(self, raw_command: str):
-        command = self._normalize_command(raw_command)
+        command = self._extract_command(self._normalize_command(raw_command))
         if not command:
             return
 
@@ -1439,6 +1407,9 @@ class RhythmGame:
     def _handle_main_menu_command(self, command: str):
         if self._command_matches(command, "jugar"):
             self._activate_main_menu_option("Jugar")
+            return True
+        if self._command_matches(command, "tutorial"):
+            self._activate_main_menu_option("Tutorial")
             return True
         if self._command_matches(command, "calibrar", "calibracion"):
             self._activate_main_menu_option("Calibrar")
@@ -1476,11 +1447,17 @@ class RhythmGame:
             self._set_difficulty("hard")
             self._show_command_feedback("Dificultad: Dificil")
             return True
+        if self._supports_speed_control() and self._command_matches(command, "lento", "normal", "rapido"):
+            self._set_note_speed(command)
+            return True
         return False
 
     def _handle_playing_command(self, command: str):
         if self._command_matches(command, "menu", "pausa", "pause", "parar", "detener"):
             self._pause_game()
+            return True
+        if self._supports_speed_control() and self._command_matches(command, "lento", "normal", "rapido"):
+            self._set_note_speed(command)
             return True
         return False
 
@@ -1536,6 +1513,13 @@ class RhythmGame:
         return False
 
     def _handle_end_state_command(self, command: str):
+        if self._is_tutorial_song():
+            if self._command_matches(command, "repetir", "reiniciar"):
+                self._start_song()
+                return True
+            if self._command_matches(command, "regresar", "volver", "menu"):
+                self._go_to_main_menu()
+                return True
         if self._command_matches(command, "volver", "menu"):
             self._restart_song()
             return True
@@ -1548,12 +1532,26 @@ class RhythmGame:
         if option == "Jugar":
             self.state = "song_select"
             self._show_command_feedback("Menu de canciones listo")
+        elif option == "Tutorial":
+            self._open_confirmation("start_tutorial", "main_menu")
         elif option == "Calibrar":
             self._run_calibration_flow()
         elif option == "Creditos":
             self.state = "credits"
         elif option == "Salir":
             self.running = False
+
+    def _start_tutorial_from_menu(self):
+        for index, song in enumerate(self.song_library):
+            if song.metadata and song.metadata.get("tutorial_mode") == "true":
+                self._apply_song_selection(index)
+                self.selected_difficulty = "easy"
+                self._rebuild_notes_for_selected_difficulty()
+                self._start_song()
+                self._show_command_feedback("Tutorial iniciado")
+                return
+        self.state = "song_select"
+        self._show_command_feedback("No encontre el tutorial")
 
     def _activate_pause_menu_option(self, option: str):
         if option == "Continuar":
@@ -1620,11 +1618,14 @@ class RhythmGame:
             pass
         self._start_song()
 
-    def _open_exit_confirmation(self, context: str):
-        self.return_state = "paused"
+    def _open_confirmation(self, context: str, return_state: str):
+        self.return_state = return_state
         self.confirm_context = context
         self.confirm_index = 1
         self.state = "confirm"
+
+    def _open_exit_confirmation(self, context: str):
+        self._open_confirmation(context, "paused")
 
     def _cancel_confirmation(self):
         self.state = self.return_state
@@ -1632,6 +1633,9 @@ class RhythmGame:
     def _resolve_confirmation(self, accepted: bool):
         if not accepted:
             self._cancel_confirmation()
+            return
+        if self.confirm_context == "start_tutorial":
+            self._start_tutorial_from_menu()
             return
         if self.confirm_context == "return_to_song_select":
             self._exit_to_song_select()
@@ -1658,17 +1662,18 @@ class RhythmGame:
         self.state = "song_select"
 
     def _run_calibration_flow(self):
-        if not TRACKING_SCRIPT_PATH.exists():
-            self._show_command_feedback("No encontre tracking-service/main.py")
-            return
-        self._show_command_feedback("Abriendo calibracion externa...")
+        self._show_command_feedback("Enviando señal de calibracion...")
+        
         try:
-            subprocess.run([sys.executable, str(TRACKING_SCRIPT_PATH)], cwd=str(TRACKING_SCRIPT_PATH.parent), check=False)
+            # Enviamos el disparador a la MacroWindow en el puerto 5055
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(b"START_CALIBRATION", ("127.0.0.1", 5055))
+            sock.close()
         except Exception:
-            self._show_command_feedback("No pude abrir la calibracion")
+            self._show_command_feedback("Error al pedir la calibracion")
             return
+            
         self.state = "main_menu"
-        self._show_command_feedback("Calibracion cerrada. Regresaste al menu")
 
     def _start_song(self):
         # --- PRECARGAR AUDIO ANTES DE INICIAR EL TIEMPO ---
@@ -1707,6 +1712,7 @@ class RhythmGame:
         self.music_started = False
         self.pause_started_at = None
         self.accumulated_pause_seconds = 0.0
+        self.note_speed_label = "normal"
         self._reset_run_stats()
 
         for note in self.notes:
@@ -1783,6 +1789,22 @@ class RhythmGame:
     def _current_profile(self):
         return DIFFICULTY_PROFILES[self.selected_difficulty]
 
+    def _is_tutorial_song(self):
+        return bool(self.song_data and self.song_data.metadata and self.song_data.metadata.get("tutorial_mode") == "true")
+
+    def _supports_speed_control(self):
+        return bool(self.song_data and self.song_data.metadata and self.song_data.metadata.get("speed_control") == "true")
+
+    def _current_preview_lead(self):
+        speed_multiplier = self.note_speed_options.get(self.note_speed_label, 1.0)
+        return PREVIEW_LEAD_SECONDS / speed_multiplier
+
+    def _set_note_speed(self, speed_label: str):
+        if speed_label not in self.note_speed_options:
+            return
+        self.note_speed_label = speed_label
+        self._show_command_feedback(f"Velocidad notas: {speed_label.capitalize()}")
+
     def _start_music(self):
         """Inicia el audio base y los stems (vocals/rhythm/drums) sincronizados."""
         if self.song_data.audio_path is None:
@@ -1813,7 +1835,7 @@ class RhythmGame:
             return
 
         current_time = pygame.time.get_ticks() / 1000.0
-        song_time = current_time - self.song_started_at - GLOBAL_OFFSET_SECONDS
+        song_time = self._current_song_time()
 
         candidate = None
         candidate_offset = None
@@ -1999,12 +2021,12 @@ class RhythmGame:
         self.screen.blit(title, title.get_rect(center=(header_box.centerx, header_box.y + 40)))
         self.screen.blit(subtitle, subtitle.get_rect(center=(header_box.centerx, header_box.y + 82)))
 
-        menu_box = pygame.Rect(0, 0, min(420, WINDOW_WIDTH - 180), 300)
-        menu_box.center = (WINDOW_WIDTH // 2, int(WINDOW_HEIGHT * 0.38))
+        menu_box = pygame.Rect(0, 0, min(430, WINDOW_WIDTH - 180), 380)
+        menu_box.center = (WINDOW_WIDTH // 2, int(WINDOW_HEIGHT * 0.40))
         self._draw_panel(menu_box, fill_alpha=108, radius=24)
 
         for index, option in enumerate(self.main_menu_options):
-            option_rect = pygame.Rect(menu_box.x + 28, menu_box.y + 52 + (index * 58), menu_box.width - 56, 42)
+            option_rect = pygame.Rect(menu_box.x + 28, menu_box.y + 42 + (index * 62), menu_box.width - 56, 40)
             if index == self.main_menu_index:
                 pygame.draw.rect(self.screen, (88, 76, 32), option_rect, border_radius=14)
                 pygame.draw.rect(self.screen, (255, 235, 130), option_rect, 2, border_radius=14)
@@ -2077,6 +2099,12 @@ class RhythmGame:
             True,
             HUD_TEXT,
         )
+        if self._supports_speed_control():
+            compact_info = self.small_font.render(
+                f"Notas: {len(self.notes)}  |  Velocidad: lento, normal, rapido",
+                True,
+                HUD_TEXT,
+            )
         self.screen.blit(compact_info, compact_info.get_rect(center=(footer_box.centerx, footer_box.y + 102)))
 
     def _draw_playfield(self):
@@ -2092,20 +2120,36 @@ class RhythmGame:
         overlay.fill((0, 0, 0, 150))
         self.screen.blit(overlay, (0, 0))
 
-        box = pygame.Rect(0, 0, 500, 230)
+        box = pygame.Rect(0, 0, 540, 280)
         box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)
         pygame.draw.rect(self.screen, (18, 18, 22), box, border_radius=22)
         pygame.draw.rect(self.screen, (240, 215, 120), box, 3, border_radius=22)
 
-        title = self.title_font.render("Cancion terminada", True, HUD_TEXT)
-        score = self.ui_font.render(f"Puntaje: {self.score}", True, HUD_TEXT)
-        combo = self.ui_font.render(f"Mejor combo: {self.best_combo}", True, HUD_TEXT)
-        hint = self.small_font.render("ENTER para volver al inicio", True, HUD_TEXT)
+        if self._is_tutorial_song():
+            title = self.title_font.render("Tutorial finalizado", True, HUD_TEXT)
+            score = self.ui_font.render(f"Puntaje: {self.score}", True, HUD_TEXT)
+            combo = self.ui_font.render(f"Mejor combo: {self.best_combo}", True, HUD_TEXT)
+            hint = self.small_font.render("Voz: repetir o regresar", True, HUD_TEXT)
+        else:
+            title = self.title_font.render("Cancion terminada", True, HUD_TEXT)
+            score = self.ui_font.render(f"Puntaje: {self.score}", True, HUD_TEXT)
+            combo = self.ui_font.render(f"Mejor combo: {self.best_combo}", True, HUD_TEXT)
+            hint = self.small_font.render("ENTER para volver al inicio", True, HUD_TEXT)
 
-        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 54)))
-        self.screen.blit(score, score.get_rect(center=(box.centerx, box.y + 115)))
-        self.screen.blit(combo, combo.get_rect(center=(box.centerx, box.y + 155)))
-        self.screen.blit(hint, hint.get_rect(center=(box.centerx, box.y + 193)))
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 56)))
+        self.screen.blit(score, score.get_rect(center=(box.centerx, box.y + 126)))
+        self.screen.blit(combo, combo.get_rect(center=(box.centerx, box.y + 166)))
+        self.screen.blit(hint, hint.get_rect(center=(box.centerx, box.y + 206)))
+
+        if self._is_tutorial_song():
+            repeat_rect = pygame.Rect(box.x + 80, box.y + 228, 130, 34)
+            back_rect = pygame.Rect(box.right - 210, box.y + 228, 130, 34)
+            pygame.draw.rect(self.screen, (64, 80, 52), repeat_rect, border_radius=10)
+            pygame.draw.rect(self.screen, (68, 54, 42), back_rect, border_radius=10)
+            repeat_surface = self.small_font.render("Repetir", True, HUD_TEXT)
+            back_surface = self.small_font.render("Regresar", True, HUD_TEXT)
+            self.screen.blit(repeat_surface, repeat_surface.get_rect(center=repeat_rect.center))
+            self.screen.blit(back_surface, back_surface.get_rect(center=back_rect.center))
 
     def _draw_failed_overlay(self):
         overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
@@ -2166,9 +2210,15 @@ class RhythmGame:
         self._draw_panel(box, border_color=(255, 180, 120), fill_alpha=152, radius=18)
         title = self.ui_font.render("Estas seguro?", True, HUD_TEXT)
         self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 42)))
+        if self.confirm_context == "start_tutorial":
+            subtitle_text = "Vas a entrar al tutorial"
+        else:
+            subtitle_text = "Confirma tu accion"
+        subtitle = self.small_font.render(subtitle_text, True, HUD_TEXT)
+        self.screen.blit(subtitle, subtitle.get_rect(center=(box.centerx, box.y + 70)))
 
         for index, option in enumerate(self.confirm_options):
-            option_rect = pygame.Rect(box.x + 54 + (index * 140), box.y + 92, 90, 40)
+            option_rect = pygame.Rect(box.x + 54 + (index * 140), box.y + 108, 90, 40)
             if index == self.confirm_index:
                 pygame.draw.rect(self.screen, (92, 60, 32), option_rect, border_radius=12)
             option_surface = self.ui_font.render(option, True, HUD_TEXT)
@@ -2192,16 +2242,18 @@ class RhythmGame:
         if not self._supports_command_input():
             return
 
-        bar_rect = pygame.Rect(24, WINDOW_HEIGHT - 54, WINDOW_WIDTH - 48, 34)
+        bar_rect = pygame.Rect(24, WINDOW_HEIGHT - 66, WINDOW_WIDTH - 48, 46)
         self._draw_panel(bar_rect, fill_alpha=112, radius=18)
 
         prompt = self.small_font.render(f"Comandos ({self.voice_backend_name}):", True, HUD_TEXT)
         command_text = self.tiny_font.render(self.command_buffer or "...", True, HUD_TEXT)
-        feedback = self.tiny_font.render(self.command_feedback[:120], True, HUD_TEXT)
+        feedback = self.tiny_font.render(self.command_feedback[:110], True, HUD_TEXT)
+        heard = self.tiny_font.render(f"Ultima voz: {self.last_voice_heard[:85]}", True, HUD_TEXT)
 
         self.screen.blit(prompt, (bar_rect.x + 12, bar_rect.y + 3))
         self.screen.blit(command_text, (bar_rect.x + 190, bar_rect.y + 5))
-        self.screen.blit(feedback, (bar_rect.x + 12, bar_rect.y + 18))
+        self.screen.blit(feedback, (bar_rect.x + 12, bar_rect.y + 19))
+        self.screen.blit(heard, (bar_rect.x + 12, bar_rect.y + 31))
 
     def _draw_hud(self, highway_rect: pygame.Rect):
         left_panel = pygame.Rect(18, 18, 248, 220)
@@ -2227,8 +2279,17 @@ class RhythmGame:
         self.screen.blit(judgement_surface, (32, 104))
         self.screen.blit(difficulty_surface, (32, 142))
         self.screen.blit(streak_surface, (32, 164))
-        self.screen.blit(song_surface, (32, 186))
-        self.screen.blit(artist_surface, (32, 208))
+        if self._supports_speed_control():
+            speed_surface = self.small_font.render(
+                f"Velocidad: {self.note_speed_label.capitalize()}",
+                True,
+                HUD_TEXT,
+            )
+            self.screen.blit(speed_surface, (32, 186))
+            self.screen.blit(song_surface, (32, 208))
+        else:
+            self.screen.blit(song_surface, (32, 186))
+            self.screen.blit(artist_surface, (32, 208))
 
         self._draw_health_meter(highway_rect)
 
@@ -2294,6 +2355,7 @@ class RhythmGame:
         self.screen.blit(label, label.get_rect(center=(shell_rect.centerx + 2, shell_rect.y - 14)))
 
     def _draw_highway(self, rect: pygame.Rect, preview_time: float, show_song_banner: bool):
+        preview_lead = self._current_preview_lead()
         top_width = rect.width * 0.36
         bottom_width = rect.width * 0.98
         top_center_x = rect.centerx
@@ -2423,13 +2485,10 @@ class RhythmGame:
                 continue
 
             time_until_hit = note.time - preview_time
-            if time_until_hit < -LATE_HIT_WINDOW_SECONDS:
-                continue  # La nota ya pasó, saltamos a revisar la otra
-                
-            if time_until_hit > PREVIEW_LEAD_SECONDS:
-                break 
+            if time_until_hit < -LATE_HIT_WINDOW_SECONDS or time_until_hit > preview_lead:
+                continue
 
-            progress = 1.0 - (time_until_hit / PREVIEW_LEAD_SECONDS)
+            progress = 1.0 - (time_until_hit / preview_lead)
             progress = max(0.0, min(1.0, progress))
             travel_progress = progress ** NOTE_TRAVEL_CURVE
 

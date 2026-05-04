@@ -1,6 +1,9 @@
 opencv-python==4.13.*
 pygame==2.6.1
 numpy
-SpeechRecognition 
-PyAudio 
-pocketsphinx
+PySide6          # Para la interfaz gráfica principal (macro_window.py)
+pywin32          # Para el manejo y anclaje de ventanas de Windows (win32api, win32gui, etc.)
+SpeechRecognition # Para la captura de comandos de voz (voice_listener)
+PyAudio          # Dependencia para usar el micrófono con SpeechRecognition
+sounddevice      # Captura/reproducción de audio adicional (presente en tu entorno)
+pocketsphinx     # Motor de reconocimiento de voz offline (presente en tu entorno)

@@ -3,7 +3,6 @@ import socket
 import threading
 import time
 
-
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 5051
 UNITY_HOST = "127.0.0.1"
@@ -103,7 +102,9 @@ class AirDrumsMiddleware:
     def _handle_configuration(self, message):
         zones = self._parse_configuration(message)
         if not zones:
-            print("[WARN] Configuracion recibida, pero no se pudieron extraer zonas validas")
+            print(
+                "[WARN] Configuracion recibida, pero no se pudieron extraer zonas validas"
+            )
             return
 
         with self.state_lock:

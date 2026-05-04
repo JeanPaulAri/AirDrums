@@ -149,6 +149,7 @@ class SongData:
     cover_path: Path | None
     vocals_path: Path | None
     rhythm_path: Path | None
+    guitar_path: Path | None
     drums_paths: list[Path]
     base_notes: list[Note]
     notes: list[Note]
@@ -213,19 +214,26 @@ DIFFICULTY_PROFILES = {
         key="easy",
         label="Facil",
         note_gap_seconds=DRUM_FRIENDLY_NOTE_GAP_SECONDS,
-        kick_gap_seconds=DRUM_FRIENDLY_KICK_GAP_SECONDS,
+        
+        # 1. Aumenta el tiempo mínimo entre bombos (ej: de 0.50 a 1.5 o incluso 2.0 segundos)
+        kick_gap_seconds=1.5,
+        
         chord_window_seconds=DRUM_CHORD_WINDOW_SECONDS,
         global_min_gap_seconds=DRUM_GLOBAL_MIN_GAP_SECONDS,
         max_notes_per_second=DRUM_MAX_NOTES_PER_SECOND,
         health_gain_hit=0.028,
-        health_loss_miss=0.060,
-        health_loss_bad_hit=0.028,
-        fail_streak=14,
+        health_loss_miss=0.001,
+        health_loss_bad_hit=0.001,
+        fail_streak=100,
         gap_fill_threshold_seconds=99.0,
         gap_fill_max_notes=0,
         fill_zones=(),
-        max_kicks_in_window=2,
-        kick_density_window_seconds=1.35,
+        
+        # 2. Reduce para que solo permita 1 bombo máximo en la ventana de tiempo
+        max_kicks_in_window=1, 
+        
+        # 3. Aumenta el tamaño de la ventana a 2.5 segundos
+        kick_density_window_seconds=2.5, 
     ),
     "medium": DifficultyProfile(
         key="medium",
@@ -236,9 +244,9 @@ DIFFICULTY_PROFILES = {
         global_min_gap_seconds=0.14,
         max_notes_per_second=6,
         health_gain_hit=0.022,
-        health_loss_miss=0.045,
+        health_loss_miss=0.03,
         health_loss_bad_hit=0.022,
-        fail_streak=16,
+        fail_streak=100,
         gap_fill_threshold_seconds=0.72,
         gap_fill_max_notes=1,
         fill_zones=("hithat", "tom superior", "hithat", "tom inferior"),
@@ -256,7 +264,7 @@ DIFFICULTY_PROFILES = {
         health_gain_hit=0.020,
         health_loss_miss=0.055,
         health_loss_bad_hit=0.026,
-        fail_streak=14,
+        fail_streak=100,
         gap_fill_threshold_seconds=0.42,
         gap_fill_max_notes=2,
         fill_zones=("hithat", "tom superior", "tom inferior", "platillo", "tom superior", "tom inferior"),
@@ -405,6 +413,7 @@ class SongLoader:
         song_ini_path = folder / "song.ini"
         midi_path = folder / "notes.mid"
         audio_path = None
+        guitar_path = folder / "guitar.ogg"
         for candidate in (folder / "song.ogg", folder / "song.wav"):
             if candidate.exists():
                 audio_path = candidate
@@ -438,6 +447,7 @@ class SongLoader:
             cover_path=cover_path if cover_path.exists() else None,
             vocals_path=vocals_path if vocals_path.exists() else None,
             rhythm_path=rhythm_path if rhythm_path.exists() else None,
+            guitar_path=guitar_path if guitar_path.exists() else None,
             drums_paths=drums_paths,
             base_notes=self._clone_notes(base_notes),
             notes=easy_notes,
@@ -1009,7 +1019,7 @@ class RhythmGame:
     """Loop principal del juego: input, lógica, dibujo y audio."""
     def __init__(self):
         # Pre-inicializar el mixer con un búfer bajo (512) para eliminar el retraso de audio
-        pygame.mixer.pre_init(44100, -16, 2, 512)
+        pygame.mixer.pre_init(48000, -16, 2, 512)
         pygame.init()
         pygame.mixer.init()
         pygame.mixer.set_num_channels(8)
@@ -1056,7 +1066,8 @@ class RhythmGame:
         self.drums_sounds = []
         self.vocals_channel = pygame.mixer.Channel(1)
         self.rhythm_channel = pygame.mixer.Channel(2)
-        self.drums_channels = [pygame.mixer.Channel(3), pygame.mixer.Channel(4), pygame.mixer.Channel(5), pygame.mixer.Channel(6)]
+        self.guitar_channel = pygame.mixer.Channel(3)
+        self.drums_channels = [pygame.mixer.Channel(4), pygame.mixer.Channel(5), pygame.mixer.Channel(6), pygame.mixer.Channel(7)]
         self._apply_song_selection(self.selected_song_index)
 
         self.state = "main_menu"
@@ -1567,6 +1578,7 @@ class RhythmGame:
         try:
             self.vocals_channel.pause()
             self.rhythm_channel.pause()
+            self.guitar_channel.pause()
             for channel in self.drums_channels:
                 channel.pause()
         except Exception:
@@ -1583,6 +1595,7 @@ class RhythmGame:
         try:
             self.vocals_channel.unpause()
             self.rhythm_channel.unpause()
+            self.guitar_channel.unpause()
             for channel in self.drums_channels:
                 channel.unpause()
         except Exception:
@@ -1593,6 +1606,7 @@ class RhythmGame:
         try:
             self.vocals_channel.stop()
             self.rhythm_channel.stop()
+            self.guitar_channel.stop()
             for channel in self.drums_channels:
                 channel.stop()
         except Exception:
@@ -1631,6 +1645,7 @@ class RhythmGame:
         try:
             self.vocals_channel.stop()
             self.rhythm_channel.stop()
+            self.guitar_channel.stop()
             for channel in self.drums_channels:
                 channel.stop()
         except Exception:
@@ -1673,6 +1688,12 @@ class RhythmGame:
             except Exception:
                 self.rhythm_sound = None
 
+            try:
+                if self.song_data.guitar_path is not None:
+                    self.guitar_sound = pygame.mixer.Sound(str(self.song_data.guitar_path))
+            except Exception:
+                self.guitar_sound = None
+
             self.drums_sounds = []
             for drum_path in self.song_data.drums_paths[:4]:
                 try:
@@ -1702,6 +1723,10 @@ class RhythmGame:
             pass
         try:
             self.rhythm_channel.stop()
+        except Exception:
+            pass
+        try:
+            self.guitar_channel.stop()
         except Exception:
             pass
         for channel in self.drums_channels:
@@ -1794,6 +1819,9 @@ class RhythmGame:
                 
             if self.rhythm_sound is not None:
                 self.rhythm_channel.play(self.rhythm_sound)
+            
+            if self.guitar_sound is not None:
+                self.guitar_channel.play(self.guitar_sound)
                 
             for index, sound in enumerate(self.drums_sounds):
                 if index < len(self.drums_channels):
@@ -1803,6 +1831,8 @@ class RhythmGame:
             pass
 
         self.music_started = True
+
+        self.song_started_at = pygame.time.get_ticks() / 1000.0 
 
     def _register_hit(self, zone: str):
         """Registra un golpe del usuario y evalúa timing/score."""
@@ -1902,6 +1932,10 @@ class RhythmGame:
             pass
         try:
             self.rhythm_channel.stop()
+        except Exception:
+            pass
+        try:
+            self.guitar_channel.stop()
         except Exception:
             pass
         for channel in self.drums_channels:
@@ -2009,7 +2043,7 @@ class RhythmGame:
             self.screen.blit(option_surface, option_surface.get_rect(center=option_rect.center))
 
         info_box = pygame.Rect(0, 0, min(720, WINDOW_WIDTH - 80), 60)
-        info_box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 140)
+        info_box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 200)
         self._draw_panel(info_box, fill_alpha=98, radius=18)
         self.screen.blit(helper, helper.get_rect(center=(info_box.centerx, info_box.centery)))
 
@@ -2063,7 +2097,7 @@ class RhythmGame:
             text_surface = self.tiny_font.render(text[:40], True, HUD_TEXT)
             self.screen.blit(text_surface, (selector_box.x + 20, item_y))
 
-        footer_box = pygame.Rect(28, WINDOW_HEIGHT - 186, WINDOW_WIDTH - 56, 118)
+        footer_box = pygame.Rect(28, WINDOW_HEIGHT - 250, WINDOW_WIDTH - 56, 118)
         self._draw_panel(footer_box, fill_alpha=105, radius=20)
         self.screen.blit(hint, hint.get_rect(center=(footer_box.centerx, footer_box.y + 28)))
         nav_hint = self.small_font.render("Flechas arriba/abajo para elegir cancion", True, HUD_TEXT)
@@ -2217,7 +2251,7 @@ class RhythmGame:
         if not self._supports_command_input():
             return
 
-        bar_rect = pygame.Rect(24, WINDOW_HEIGHT - 66, WINDOW_WIDTH - 48, 46)
+        bar_rect = pygame.Rect(24, WINDOW_HEIGHT - 300, WINDOW_WIDTH - 48, 46)
         self._draw_panel(bar_rect, fill_alpha=112, radius=18)
 
         prompt = self.small_font.render(f"Comandos ({self.voice_backend_name}):", True, HUD_TEXT)
@@ -2268,7 +2302,7 @@ class RhythmGame:
 
         self._draw_health_meter(highway_rect)
 
-        bottom_panel = pygame.Rect(max(18, WINDOW_WIDTH - 320), WINDOW_HEIGHT - 118, 300, 30)
+        bottom_panel = pygame.Rect(max(18, WINDOW_WIDTH - 320), WINDOW_HEIGHT - 380, 300, 30)
         self._draw_panel(bottom_panel, fill_alpha=96, radius=14)
         port_surface = self.small_font.render("Recibiendo golpes UDP 5053", True, HUD_TEXT)
         self.screen.blit(port_surface, (bottom_panel.x + 12, bottom_panel.y + 6))
@@ -2505,11 +2539,13 @@ class RhythmGame:
     def _current_song_time(self):
         if self.song_started_at is None:
             return 0.0
+
         paused_time = self.accumulated_pause_seconds
         if self.pause_started_at is not None:
             paused_time += (pygame.time.get_ticks() / 1000.0) - self.pause_started_at
+            
         return (pygame.time.get_ticks() / 1000.0) - self.song_started_at - paused_time - GLOBAL_OFFSET_SECONDS
-
+        
     def _lane_center_x(self, left_top, left_bottom, right_top, right_bottom, y, lane_index):
         progress = self._vertical_progress(left_top[1], left_bottom[1], y)
         left = self._interpolate_point(left_top, left_bottom, progress)

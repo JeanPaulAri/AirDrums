@@ -11,7 +11,8 @@ public class TrackingIntegrationManager : MonoBehaviour
     [SerializeField] private StickVisualizer rightStickVisualizer;
     [SerializeField] private StickVisualizer leftStickVisualizer;
     [SerializeField] private StickVisualizer footStickVisualizer;
-
+    [SerializeField] private DrumKitLayoutMapper drumKitLayoutMapper;
+    
     [Header("Debug")]
     [SerializeField] private bool logRawMessages = true;
     [SerializeField] private bool logParsedHits = true;
@@ -230,21 +231,19 @@ public class TrackingIntegrationManager : MonoBehaviour
 
         if (debugOverlay != null)
         {
-            debugOverlay.gameObject.SetActive(showDebugOverlay);
             debugOverlay.SetConfiguration(message);
-
-            if (showDebugOverlay)
-            {
-                if (overlayRoutine != null)
-                {
-                    StopCoroutine(overlayRoutine);
-                }
-
-                overlayRoutine = StartCoroutine(HideOverlayAfterDelay());
-            }
         }
 
-        Debug.Log("[TrackingIntegrationManager] Configuración cargada: " +
+        if (drumKitLayoutMapper != null)
+        {
+            drumKitLayoutMapper.ApplyConfiguration(message);
+        }
+        else
+        {
+            Debug.LogWarning("[TrackingIntegrationManager] DrumKitLayoutMapper no asignado.");
+        }
+
+        Debug.Log("[TrackingIntegrationManager] Configuracion cargada: " +
                   message.dim_x + "x" + message.dim_y +
                   " | elementos=" + message.elementos.Length);
     }
@@ -269,24 +268,33 @@ public class TrackingIntegrationManager : MonoBehaviour
             debugOverlay.UpdateStickPosition(2, message.stick_2_x, message.stick_2_y);
         }
 
-        if (!enable3DStickMotion || currentConfiguration == null)
+        if (!enable3DStickMotion || debugOverlay == null)
         {
             return;
         }
 
-        float rightX = NormalizeToUnit(message.stick_1_x, currentConfiguration.dim_x);
-        float rightY = NormalizeToUnit(message.stick_1_y, currentConfiguration.dim_y);
-        float leftX = NormalizeToUnit(message.stick_2_x, currentConfiguration.dim_x);
-        float leftY = NormalizeToUnit(message.stick_2_y, currentConfiguration.dim_y);
-
         if (rightStickVisualizer != null)
         {
-            rightStickVisualizer.SetNormalizedTrackingPosition(rightX, rightY);
+            if (debugOverlay.TryGetStickViewport(1, out Vector2 rightViewport))
+            {
+                rightStickVisualizer.SetViewportTrackingPosition(rightViewport);
+            }
+            else
+            {
+                rightStickVisualizer.ClearTracking();
+            }
         }
 
         if (leftStickVisualizer != null)
         {
-            leftStickVisualizer.SetNormalizedTrackingPosition(leftX, leftY);
+            if (debugOverlay.TryGetStickViewport(2, out Vector2 leftViewport))
+            {
+                leftStickVisualizer.SetViewportTrackingPosition(leftViewport);
+            }
+            else
+            {
+                leftStickVisualizer.ClearTracking();
+            }
         }
     }
 

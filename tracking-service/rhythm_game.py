@@ -1480,7 +1480,7 @@ class RhythmGame:
         return False
 
     def _handle_playing_command(self, command: str):
-        if self._command_matches(command, "menu", "pausa", "pause", "parar", "detener"):
+        if self._command_matches(command, "menu", "pausa", "pause", "parar", "detener", "stop", "pau"):
             self._pause_game()
             return True
         if self._supports_speed_control() and self._command_matches(command, "lento", "normal", "rapido"):

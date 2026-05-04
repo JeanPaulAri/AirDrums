@@ -1114,6 +1114,7 @@ class RhythmGame:
         self.note_speed_options = {"lento": 0.8, "normal": 1.0, "rapido": 1.25}
         self.note_speed_label = "normal"
         self.last_voice_heard = "Sin voz detectada aun"
+        self.last_command_time = 0.0
 
         self.score = 0
         self.combo = 0
@@ -1387,9 +1388,24 @@ class RhythmGame:
         return command
 
     def _submit_command(self, raw_command: str):
-        command = self._extract_command(self._normalize_command(raw_command))
+        # 1. Obtenemos el tiempo actual
+        current_time = pygame.time.get_ticks() / 1000.0
+        
+        if not raw_command:
+            return
+            
+        command = self._normalize_command(raw_command)
+        command = self._extract_command(command)
         if not command:
             return
+
+        # 2. Verificamos si no ha pasado ni medio segundo (0.6s) desde el último comando igual
+        if current_time - self.last_command_time < 0.6 and command == getattr(self, "last_command_executed", ""):
+            return # Cancelamos el doble salto
+            
+        # 3. Guardamos el tiempo y el comando para el bloqueo
+        self.last_command_time = current_time
+        self.last_command_executed = command
 
         handled = False
         if self.state == "main_menu":

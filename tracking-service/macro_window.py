@@ -552,7 +552,7 @@ class AirDrumsMacroWindow(QMainWindow):
         main_layout.addWidget(self.rhythm_panel, stretch=1)
 
         # Ocultamos explícitamente el panel de OpenCV para que no reaccione en la UI
-        self.opencv_panel.hide()
+        # self.opencv_panel.hide()
 
         root_layout.addLayout(header)
         root_layout.addLayout(main_layout, stretch=1)
@@ -730,9 +730,9 @@ class AirDrumsMacroWindow(QMainWindow):
 
         # --- Ocultar ventanas auxiliares ---
         hide_window_by_hints(MASK_TITLE_HINTS) # Oculta la máscara
-        if not self.is_calibrating:
+        #if not self.is_calibrating:
             # Si NO estamos calibrando, el juego general arrojará una ventana en game.py que no queremos ver
-            hide_window_by_hints(OPENCV_TITLE_HINTS) 
+            #hide_window_by_hints(OPENCV_TITLE_HINTS) 
 
         self.fit_all()
 

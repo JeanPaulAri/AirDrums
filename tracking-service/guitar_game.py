@@ -211,6 +211,7 @@ class DifficultyProfile:
     """Parámetros de simplificación y supervivencia por dificultad."""
     key: str
     label: str
+    speed_multiplier: float
     note_gap_seconds: float
     kick_gap_seconds: float
     chord_window_seconds: float
@@ -232,6 +233,7 @@ DIFFICULTY_PROFILES = {
     "easy": DifficultyProfile(
         key="easy",
         label="Facil",
+        speed_multiplier=0.75,
         note_gap_seconds=DRUM_FRIENDLY_NOTE_GAP_SECONDS,
         
         # 1. Aumenta el tiempo mínimo entre bombos (ej: de 0.50 a 1.5 o incluso 2.0 segundos)
@@ -257,6 +259,7 @@ DIFFICULTY_PROFILES = {
     "medium": DifficultyProfile(
         key="medium",
         label="Medio",
+        speed_multiplier=1.0,
         note_gap_seconds=0.19,
         kick_gap_seconds=0.36,
         chord_window_seconds=0.10,
@@ -275,14 +278,15 @@ DIFFICULTY_PROFILES = {
     "hard": DifficultyProfile(
         key="hard",
         label="Dificil",
+        speed_multiplier=1.5,
         note_gap_seconds=0.11,
         kick_gap_seconds=0.24,
         chord_window_seconds=0.05,
         global_min_gap_seconds=0.07,
-        max_notes_per_second=9,
+        max_notes_per_second=100,
         health_gain_hit=0.020,
-        health_loss_miss=0.055,
-        health_loss_bad_hit=0.026,
+        health_loss_miss=0.01,
+        health_loss_bad_hit=0.01,
         fail_streak=100,
         gap_fill_threshold_seconds=0.42,
         gap_fill_max_notes=2,
@@ -663,13 +667,15 @@ class SongLoader:
 
         converter = MidiTempoConverter(division, tempo_events)
 
+        if "PART GUITAR" in track_notes:
+            notes = self._build_notes_from_track(track_notes["PART GUITAR"], converter, GUITAR_EXPERT_MAP)
+            return notes, self._song_length_seconds(notes), "PART GUITAR", False
+
         if "PART DRUMS" in track_notes:
             notes = self._build_notes_from_track(track_notes["PART DRUMS"], converter, DRUM_EXPERT_MAP)
-            notes = self._cleanup_real_drum_chart(notes)
-            return notes, self._song_length_seconds(notes), "PART DRUMS", False
+            return notes, self._song_length_seconds(notes), "PART DRUMS COMPATIBLE", False
 
-        # Only accept true drum charts for Drum Hero mode
-        return [], 0.0, "Sin PART DRUMS", False
+        return [], 0.0, "Sin pistas compatibles", False
 
     def _parse_track(self, track_bytes: bytes):
         """Parsea un track MIDI y devuelve (nombre, notas, tempos)."""
@@ -992,14 +998,11 @@ class SongLoader:
 
         converter = MidiTempoConverter(division, tempo_events)
 
-        # Build drum notes
-        if "PART DRUMS" in track_notes:
-            notes = self._build_notes_from_track(track_notes["PART DRUMS"], converter, DRUM_EXPERT_MAP)
-        elif "PART GUITAR" in track_notes:
-            guitar_notes = self._build_notes_from_track(track_notes["PART GUITAR"], converter, GUITAR_EXPERT_MAP)
-            bass_notes = self._build_notes_from_track(track_notes.get("PART BASS", []), converter, GUITAR_EXPERT_MAP)
-            notes = self._adapt_guitar_chart_to_drums(guitar_notes, bass_notes)
+        # Build guitar notes explicitly
+        if "PART GUITAR" in track_notes:
+            notes = self._build_notes_from_track(track_notes["PART GUITAR"], converter, GUITAR_EXPERT_MAP)
         else:
+            # Si una cancion no tiene guitarra (muy raro), dejamos vacio o caemos a otro instrumento
             notes = []
 
         # Apply simplification to avoid dense charts
@@ -1204,7 +1207,7 @@ class RhythmGame:
         
         # 3. Le indica a SDL (Pygame) en qué coordenada colocar la ventana
         # 'x,y' -> arranca en el centro (anchura / 2) y en lo más alto (0)
-        os.environ['SDL_VIDEO_WINDOW_POS'] = f"{half_width},0"
+        os.environ['SDL_VIDEO_WINDOW_POS'] = "0,0"
         
         # 4. Asigna el nuevo tamaño (mitad del ancho, alto completo)
         global WINDOW_WIDTH, WINDOW_HEIGHT
@@ -2151,7 +2154,6 @@ class RhythmGame:
             self._start_song(is_remote_start=True)
             self.multiplayer_host_started = True
             return
-        
         if packet_type == "score_sync":
             self.multiplayer_remote_score = int(payload.get("score", 0))
             self.multiplayer_remote_combo = int(payload.get("combo", 0))
@@ -2362,8 +2364,16 @@ class RhythmGame:
         return bool(self.song_data and self.song_data.metadata and self.song_data.metadata.get("speed_control") == "true")
 
     def _current_preview_lead(self):
-        speed_multiplier = self.note_speed_options.get(self.note_speed_label, 1.0)
-        return PREVIEW_LEAD_SECONDS / speed_multiplier
+        # 1. Multiplicador de opciones personalizadas (si las usas)
+        option_speed_multiplier = self.note_speed_options.get(self.note_speed_label, 1.0)
+        
+        # 2. Multiplicador por la dificultad actual
+        difficulty_speed_multiplier = self._current_profile().speed_multiplier
+        
+        # Se combinan ambas y dividen al tiempo base (PREVIEW_LEAD_SECONDS original de 3.35s)
+        total_multiplier = option_speed_multiplier * difficulty_speed_multiplier
+        
+        return PREVIEW_LEAD_SECONDS / total_multiplier
 
     def _set_note_speed(self, speed_label: str):
         if speed_label not in self.note_speed_options:

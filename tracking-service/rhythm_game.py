@@ -11,6 +11,7 @@ import math
 import socket
 import subprocess
 import sys
+import time
 import unicodedata
 from collections import deque
 from bisect import bisect_right
@@ -32,6 +33,7 @@ UDP_BUFFER_SIZE = 2048
 # Entrada de comandos de voz desde voice_listener.py por UDP.
 VOICE_UDP_HOST = "127.0.0.1"
 VOICE_UDP_PORT = 5054
+MULTIPLAYER_TCP_PORT = 5060
 
 # Título y carpeta base de canciones.
 APP_TITLE = "AirDrums Rhythm Highway"
@@ -162,12 +164,28 @@ class SongData:
 class UdpVoiceReceiver:
     """Recibe comandos de voz desde voice_listener.py por UDP."""
     def __init__(self, host: str, port: int):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind((host, port))
-        self.socket.setblocking(False)
+        # Este cambio evita que una segunda instancia del juego se cierre si el puerto de voz ya está ocupado.
+        self.socket = None
+        self.available = False
+        self.bind_error = ""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.bind((host, port))
+            self.socket.setblocking(False)
+            self.available = True
+        except OSError as exc:
+            self.bind_error = str(exc)
+            if self.socket is not None:
+                try:
+                    self.socket.close()
+                except OSError:
+                    pass
+            self.socket = None
 
     def poll_commands(self):
         """Retorna lista de comandos de voz recibidos."""
+        if self.socket is None:
+            return []
         commands = []
         while True:
             try:
@@ -184,7 +202,8 @@ class UdpVoiceReceiver:
         return commands
 
     def close(self):
-        self.socket.close()
+        if self.socket is not None:
+            self.socket.close()
 
 
 @dataclass(frozen=True)
@@ -357,14 +376,164 @@ class ExternalVoiceProcess:
         self.process = None
 
 
+class MultiplayerSession:
+    """Maneja la conexion host/cliente para el modo competitivo por red local."""
+    def __init__(self):
+        self.role = None
+        self.listen_socket = None
+        self.peer_socket = None
+        self.receive_buffer = ""
+        self.connected = False
+        self.last_error = ""
+        self.host = ""
+        self.port = MULTIPLAYER_TCP_PORT
+
+    def start_host(self, host: str = "0.0.0.0", port: int = MULTIPLAYER_TCP_PORT):
+        # Este cambio crea la sala TCP donde el rival se conecta desde la misma red.
+        self.close()
+        self.role = "host"
+        self.host = host
+        self.port = port
+        self.listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listen_socket.bind((host, port))
+        self.listen_socket.listen(1)
+        self.listen_socket.setblocking(False)
+        self.connected = False
+        self.last_error = ""
+
+    def join_host(self, host: str, port: int = MULTIPLAYER_TCP_PORT):
+        # Este cambio conecta al cliente remoto con la IP del host para entrar a la partida.
+        self.close()
+        self.role = "client"
+        self.host = host
+        self.port = port
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.settimeout(4.0)
+        client_socket.connect((host, port))
+        client_socket.settimeout(0.0)
+        self.peer_socket = client_socket
+        self.connected = True
+        self.last_error = ""
+        self._send_packet({"type": "hello", "role": "client"})
+
+    def poll_messages(self):
+        # Este cambio procesa mensajes de red sin congelar el juego mientras corre el loop principal.
+        messages = []
+        if self.listen_socket is not None and self.peer_socket is None:
+            try:
+                peer_socket, _ = self.listen_socket.accept()
+                peer_socket.setblocking(False)
+                self.peer_socket = peer_socket
+                self.connected = True
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                self.last_error = str(exc)
+
+        if self.peer_socket is None:
+            return messages
+
+        while True:
+            try:
+                data = self.peer_socket.recv(4096)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                self.last_error = str(exc)
+                self.close()
+                break
+
+            if not data:
+                self.close()
+                break
+
+            try:
+                self.receive_buffer += data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+            while "\n" in self.receive_buffer:
+                raw_line, self.receive_buffer = self.receive_buffer.split("\n", 1)
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    messages.append(json.loads(raw_line))
+                except json.JSONDecodeError:
+                    continue
+
+        return messages
+
+    def send(self, packet_type: str, **payload):
+        # Este cambio empaqueta mensajes cortos para sincronizar lobby, seleccion y arranque.
+        packet = {"type": packet_type}
+        packet.update(payload)
+        self._send_packet(packet)
+
+    def _send_packet(self, payload: dict):
+        # Este cambio escribe cada mensaje de red en una sola linea JSON para simplificar el protocolo.
+        if self.peer_socket is None:
+            return
+        try:
+            encoded = (json.dumps(payload) + "\n").encode("utf-8")
+            self.peer_socket.sendall(encoded)
+        except OSError as exc:
+            self.last_error = str(exc)
+            self.close()
+
+    def close(self):
+        # Este cambio limpia cualquier socket abierto cuando se cancela o termina el modo multijugador.
+        sockets_to_close = [self.peer_socket, self.listen_socket]
+        for current_socket in sockets_to_close:
+            if current_socket is None:
+                continue
+            try:
+                current_socket.close()
+            except OSError:
+                pass
+        self.listen_socket = None
+        self.peer_socket = None
+        self.receive_buffer = ""
+        self.connected = False
+        self.role = None
+
+    def get_local_ip(self):
+        # Este cambio intenta descubrir la IP local visible en la red para mostrarsela al host.
+        probe_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe_socket.connect(("8.8.8.8", 80))
+            return probe_socket.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+        finally:
+            probe_socket.close()
+
+
 class UdpHitReceiver:
     """Recibe golpes de batería desde middleware por UDP (no bloqueante)."""
     def __init__(self, host: str, port: int):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind((host, port))
-        self.socket.setblocking(False)
+        # Este cambio permite abrir una segunda ventana del juego aunque el puerto UDP de golpes ya esté en uso.
+        self.socket = None
+        self.available = False
+        self.bind_error = ""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.bind((host, port))
+            self.socket.setblocking(False)
+            self.available = True
+        except OSError as exc:
+            self.bind_error = str(exc)
+            if self.socket is not None:
+                try:
+                    self.socket.close()
+                except OSError:
+                    pass
+            self.socket = None
 
     def poll_hits(self):
+        if self.socket is None:
+            return []
         hits = []
 
         while True:
@@ -385,7 +554,8 @@ class UdpHitReceiver:
         return hits
 
     def close(self):
-        self.socket.close()
+        if self.socket is not None:
+            self.socket.close()
 
 
 class SongLoader:
@@ -1087,7 +1257,6 @@ class RhythmGame:
         self.rhythm_channel = pygame.mixer.Channel(2)
         self.guitar_channel = pygame.mixer.Channel(3)
         self.drums_channels = [pygame.mixer.Channel(4), pygame.mixer.Channel(5), pygame.mixer.Channel(6), pygame.mixer.Channel(7)]
-        self._apply_song_selection(self.selected_song_index)
 
         self.state = "main_menu"
         self.song_started_at = None
@@ -1099,8 +1268,10 @@ class RhythmGame:
         self.command_buffer = ""
         self.command_feedback = "Escribe un comando y presiona ENTER"
         self.command_feedback_until = 0.0
-        self.main_menu_options = ["Jugar", "Tutorial", "Calibrar", "Creditos", "Salir"]
+        self.main_menu_options = ["Jugar", "Multijugador", "Tutorial", "Calibrar", "Creditos", "Salir"]
         self.main_menu_index = 0
+        self.multiplayer_menu_options = ["Crear sala", "Unirse", "Volver"]
+        self.multiplayer_menu_index = 0
         self.pause_menu_options = ["Continuar", "Reiniciar", "Cambiar nivel", "Salir"]
         self.pause_menu_index = 0
         self.pause_difficulty_options = ["Facil", "Normal", "Dificil", "Atras"]
@@ -1115,6 +1286,18 @@ class RhythmGame:
         self.note_speed_label = "normal"
         self.last_voice_heard = "Sin voz detectada aun"
         self.last_command_time = 0.0
+        self.multiplayer_session = MultiplayerSession()
+        self.multiplayer_mode = False
+        self.multiplayer_role = None
+        self.multiplayer_status = "Modo individual activo"
+        self.multiplayer_join_ip = ""
+        self.multiplayer_remote_score = 0
+        self.multiplayer_remote_combo = 0
+        self.multiplayer_remote_name = "Rival"
+        self.multiplayer_last_sync_sent_at = 0.0
+        self.multiplayer_local_ip = self.multiplayer_session.get_local_ip()
+        self.multiplayer_host_started = False
+        self._apply_song_selection(self.selected_song_index)
 
         self.score = 0
         self.combo = 0
@@ -1131,13 +1314,19 @@ class RhythmGame:
             self.command_feedback = "Voz activa: menu o pausa en partida; jugar, calibrar, creditos, salir"
         elif "micro no configurado" in self.voice_backend_name.lower():
             self.command_feedback = "El micro no esta activo aqui: faltan speech_recognition y pyaudio"
+        if not self.receiver.available:
+            self.command_feedback = "Instancia secundaria: sin UDP 5053, usa teclado o cliente remoto"
+        elif not self.voice_receiver.available:
+            self.command_feedback = "Instancia secundaria: sin voz UDP 5054, usa teclado o texto"
 
     def _detect_voice_backend_name(self):
+        # Este cambio mantiene visible si la voz externa está activa mientras convivimos con el modo multijugador.
         if getattr(self, "voice_listener", None) is not None and self.voice_listener.available:
             return self.voice_listener.backend_name
         return "Texto (micro no configurado)"
 
     def run(self):
+        # Este cambio deja corriendo red, voz y juego en el mismo loop sin romper el modo individual.
         """Bucle principal de render + update."""
         try:
             while self.running:
@@ -1151,6 +1340,7 @@ class RhythmGame:
                 self.voice_listener.stop()
             except Exception:
                 pass
+            self.multiplayer_session.close()
             self.voice_receiver.close()
             self.receiver.close()
             pygame.quit()
@@ -1167,13 +1357,16 @@ class RhythmGame:
         return pygame.transform.smoothscale(surface, (190, 190))
 
     def _handle_events(self):
+        # Este cambio agrega navegacion para crear/unirse a salas y escribir la IP del host desde teclado.
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
                 return
 
             if event.type == pygame.TEXTINPUT:
-                if self._supports_command_input():
+                if self.state == "multiplayer_join":
+                    self.multiplayer_join_ip += event.text
+                elif self._supports_command_input():
                     self.command_buffer += event.text
                 continue
 
@@ -1183,11 +1376,18 @@ class RhythmGame:
                         self._pause_game()
                     elif self.state == "paused":
                         self._resume_game()
+                    elif self.state == "multiplayer_join":
+                        self.state = "multiplayer_menu"
+                    elif self.state in ("multiplayer_menu", "multiplayer_host_lobby", "multiplayer_client_wait"):
+                        self._leave_multiplayer_mode()
+                        self._go_to_main_menu()
                     elif self.state == "pause_difficulty":
                         self.state = "paused"
                     elif self.state == "confirm":
                         self._cancel_confirmation()
                     elif self.state in ("song_select", "credits"):
+                        if self.state == "song_select" and self.multiplayer_mode:
+                            self._leave_multiplayer_mode()
                         self._go_to_main_menu()
                     else:
                         self.running = False
@@ -1202,6 +1402,17 @@ class RhythmGame:
                         self.command_buffer = ""
                         continue
 
+                if self.state == "multiplayer_join":
+                    if event.key == pygame.K_BACKSPACE:
+                        self.multiplayer_join_ip = self.multiplayer_join_ip[:-1]
+                        continue
+                    if event.key == pygame.K_RETURN:
+                        self._join_multiplayer_session(self.multiplayer_join_ip.strip())
+                        continue
+                    if event.key == pygame.K_ESCAPE:
+                        self.state = "multiplayer_menu"
+                        continue
+
                 if self.state == "main_menu" and event.key == pygame.K_DOWN:
                     self.main_menu_index = (self.main_menu_index + 1) % len(self.main_menu_options)
                     continue
@@ -1214,36 +1425,56 @@ class RhythmGame:
                     self._activate_main_menu_option(self.main_menu_options[self.main_menu_index])
                     continue
 
+                if self.state == "multiplayer_menu" and event.key == pygame.K_DOWN:
+                    self.multiplayer_menu_index = (self.multiplayer_menu_index + 1) % len(self.multiplayer_menu_options)
+                    continue
+
+                if self.state == "multiplayer_menu" and event.key == pygame.K_UP:
+                    self.multiplayer_menu_index = (self.multiplayer_menu_index - 1) % len(self.multiplayer_menu_options)
+                    continue
+
+                if self.state == "multiplayer_menu" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self._activate_multiplayer_menu_option(self.multiplayer_menu_options[self.multiplayer_menu_index])
+                    continue
+
                 if self.state == "song_select" and event.key == pygame.K_DOWN:
-                    self._apply_song_selection(self.selected_song_index + 1)
+                    if self._can_control_song_select():
+                        self._apply_song_selection(self.selected_song_index + 1)
                     continue
 
                 if self.state == "song_select" and event.key == pygame.K_UP:
-                    self._apply_song_selection(self.selected_song_index - 1)
+                    if self._can_control_song_select():
+                        self._apply_song_selection(self.selected_song_index - 1)
                     continue
 
                 if self.state == "song_select" and event.key in (pygame.K_LEFT, pygame.K_q):
-                    self._cycle_difficulty(-1)
+                    if self._can_control_song_select():
+                        self._cycle_difficulty(-1)
                     continue
 
                 if self.state == "song_select" and event.key in (pygame.K_RIGHT, pygame.K_e):
-                    self._cycle_difficulty(1)
+                    if self._can_control_song_select():
+                        self._cycle_difficulty(1)
                     continue
 
                 if self.state == "song_select" and event.key == pygame.K_1:
-                    self._set_difficulty("easy")
+                    if self._can_control_song_select():
+                        self._set_difficulty("easy")
                     continue
 
                 if self.state == "song_select" and event.key == pygame.K_2:
-                    self._set_difficulty("medium")
+                    if self._can_control_song_select():
+                        self._set_difficulty("medium")
                     continue
 
                 if self.state == "song_select" and event.key == pygame.K_3:
-                    self._set_difficulty("hard")
+                    if self._can_control_song_select():
+                        self._set_difficulty("hard")
                     continue
 
                 if self.state == "song_select" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    self._start_song()
+                    if self._can_control_song_select():
+                        self._start_song()
                     continue
 
                 if self.state in ("finished", "failed") and event.key == pygame.K_RETURN:
@@ -1291,10 +1522,11 @@ class RhythmGame:
                     continue
 
                 zone = KEYBOARD_ZONE_MAP.get(event.key)
-                if zone and self.state == "playing":
+                if zone and self.state == "playing" and self._accepts_keyboard_hits():
                     self._register_hit(zone)
 
     def _update(self, dt: float):
+        # Este cambio procesa la red local y sincroniza el lobby antes de actualizar la partida.
         current_time = pygame.time.get_ticks() / 1000.0
         self.display_health += (self.health - self.display_health) * min(1.0, dt * 8.0)
 
@@ -1304,6 +1536,8 @@ class RhythmGame:
 
         if self.voice_listener is not None:
             self.voice_listener.refresh_status()
+
+        self._poll_multiplayer_network()
 
         for voice_command in self.voice_receiver.poll_commands():
             self.last_voice_heard = voice_command
@@ -1319,14 +1553,19 @@ class RhythmGame:
 
             song_time = self._current_song_time()
             self._judge_missed_notes(song_time)
+            self._send_multiplayer_score_sync(current_time)
 
             if song_time >= self.song_length:
                 self.state = "finished"
                 pygame.mixer.music.stop()
 
     def _supports_command_input(self):
+        # Este cambio permite que los nuevos submenus de red también acepten comandos por voz/texto.
         return self.state in {
             "main_menu",
+            "multiplayer_menu",
+            "multiplayer_host_lobby",
+            "multiplayer_client_wait",
             "song_select",
             "credits",
             "paused",
@@ -1337,6 +1576,7 @@ class RhythmGame:
         }
 
     def _normalize_command(self, command: str):
+        # Este cambio normaliza palabras de voz para reutilizarlas en menús individuales y multijugador.
         lowered = command.strip().lower()
         normalized = unicodedata.normalize("NFD", lowered)
         normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
@@ -1347,12 +1587,15 @@ class RhythmGame:
         return number_aliases.get(normalized, normalized)
 
     def _show_command_feedback(self, message: str, duration: float = 2.6):
+        # Este cambio centraliza mensajes cortos de estado para mostrar conexión y sincronización de red.
         self.command_feedback = message
         self.command_feedback_until = (pygame.time.get_ticks() / 1000.0) + duration
 
     def _extract_command(self, command: str):
+        # Este cambio añade comandos de lobby para controlar el multijugador por voz.
         known_commands = [
             "cambiar nivel",
+            "crear sala",
             "creditos del juego",
             "calibracion",
             "continuar",
@@ -1360,6 +1603,11 @@ class RhythmGame:
             "siguiente",
             "regresar",
             "tutorial",
+            "multijugador",
+            "unirse",
+            "iniciar",
+            "host",
+            "conectar",
             "calibrar",
             "creditos",
             "dificil",
@@ -1388,6 +1636,7 @@ class RhythmGame:
         return command
 
     def _submit_command(self, raw_command: str):
+        # Este cambio enruta también los comandos del lobby y del cliente remoto dentro del mismo parser.
         # 1. Obtenemos el tiempo actual
         current_time = pygame.time.get_ticks() / 1000.0
         
@@ -1410,6 +1659,14 @@ class RhythmGame:
         handled = False
         if self.state == "main_menu":
             handled = self._handle_main_menu_command(command)
+        elif self.state == "multiplayer_menu":
+            handled = self._handle_multiplayer_menu_command(command)
+        elif self.state == "multiplayer_join":
+            handled = self._handle_multiplayer_join_command(command)
+        elif self.state == "multiplayer_host_lobby":
+            handled = self._handle_multiplayer_host_lobby_command(command)
+        elif self.state == "multiplayer_client_wait":
+            handled = self._handle_multiplayer_client_wait_command(command)
         elif self.state == "song_select":
             handled = self._handle_song_select_command(command)
         elif self.state == "playing":
@@ -1429,11 +1686,16 @@ class RhythmGame:
             self._show_command_feedback(f"No entendi '{raw_command.strip()}'")
 
     def _command_matches(self, command: str, *options: str):
+        # Este cambio deja un helper único para comparar comandos de voz y teclado textual.
         return command in options
 
     def _handle_main_menu_command(self, command: str):
+        # Este cambio permite entrar al nuevo menú multijugador por voz.
         if self._command_matches(command, "jugar"):
             self._activate_main_menu_option("Jugar")
+            return True
+        if self._command_matches(command, "multijugador"):
+            self._activate_main_menu_option("Multijugador")
             return True
         if self._command_matches(command, "tutorial"):
             self._activate_main_menu_option("Tutorial")
@@ -1449,30 +1711,79 @@ class RhythmGame:
             return True
         return False
 
+    def _handle_multiplayer_menu_command(self, command: str):
+        # Este cambio maneja por voz la creación o unión a una sala local.
+        if self._command_matches(command, "crear sala", "host"):
+            self._activate_multiplayer_menu_option("Crear sala")
+            return True
+        if self._command_matches(command, "unirse", "conectar"):
+            self._activate_multiplayer_menu_option("Unirse")
+            return True
+        if self._command_matches(command, "volver", "atras", "menu"):
+            self._activate_multiplayer_menu_option("Volver")
+            return True
+        return False
+
+    def _handle_multiplayer_host_lobby_command(self, command: str):
+        # Este cambio deja al host salir del lobby o comenzar a elegir canción cuando el rival ya entró.
+        if self._command_matches(command, "volver", "atras", "salir"):
+            self._leave_multiplayer_mode()
+            self._go_to_main_menu()
+            return True
+        if self.multiplayer_session.connected and self._command_matches(command, "jugar", "iniciar"):
+            self.state = "song_select"
+            self._show_command_feedback("Rival conectado. Elige una cancion")
+            return True
+        return False
+
+    def _handle_multiplayer_join_command(self, command: str):
+        # Este cambio permite cancelar por voz la pantalla de conexión por IP del cliente.
+        if self._command_matches(command, "volver", "atras", "salir"):
+            self.state = "multiplayer_menu"
+            return True
+        return False
+
+    def _handle_multiplayer_client_wait_command(self, command: str):
+        # Este cambio permite al cliente cancelar la espera del host desde voz o teclado textual.
+        if self._command_matches(command, "volver", "atras", "salir"):
+            self._leave_multiplayer_mode()
+            self._go_to_main_menu()
+            return True
+        return False
+
     def _handle_song_select_command(self, command: str):
+        # Este cambio bloquea al cliente remoto para que solo el host controle canción e inicio.
         if self._command_matches(command, "siguiente"):
-            self._apply_song_selection(self.selected_song_index + 1)
+            if self._can_control_song_select():
+                self._apply_song_selection(self.selected_song_index + 1)
             return True
         if self._command_matches(command, "atras", "anterior"):
-            self._apply_song_selection(self.selected_song_index - 1)
+            if self._can_control_song_select():
+                self._apply_song_selection(self.selected_song_index - 1)
             return True
         if self._command_matches(command, "volver", "menu"):
+            if self.multiplayer_mode:
+                self._leave_multiplayer_mode()
             self._go_to_main_menu()
             return True
         if self._command_matches(command, "jugar", "empezar"):
-            self._start_song()
+            if self._can_control_song_select():
+                self._start_song()
             return True
         if self._command_matches(command, "facil"):
-            self._set_difficulty("easy")
-            self._show_command_feedback("Dificultad: Facil")
+            if self._can_control_song_select():
+                self._set_difficulty("easy")
+                self._show_command_feedback("Dificultad: Facil")
             return True
         if self._command_matches(command, "medio"):
-            self._set_difficulty("medium")
-            self._show_command_feedback("Dificultad: Medio")
+            if self._can_control_song_select():
+                self._set_difficulty("medium")
+                self._show_command_feedback("Dificultad: Medio")
             return True
         if self._command_matches(command, "dificil"):
-            self._set_difficulty("hard")
-            self._show_command_feedback("Dificultad: Dificil")
+            if self._can_control_song_select():
+                self._set_difficulty("hard")
+                self._show_command_feedback("Dificultad: Dificil")
             return True
         if self._supports_speed_control() and self._command_matches(command, "lento", "normal", "rapido"):
             self._set_note_speed(command)
@@ -1540,6 +1851,7 @@ class RhythmGame:
         return False
 
     def _handle_end_state_command(self, command: str):
+        # Este cambio conserva el flujo final y además permite volver a menú desde partidas de red.
         if self._is_tutorial_song():
             if self._command_matches(command, "repetir", "reiniciar"):
                 self._start_song()
@@ -1556,10 +1868,17 @@ class RhythmGame:
         return False
 
     def _activate_main_menu_option(self, option: str):
+        # Este cambio añade la puerta de entrada al nuevo flujo de multijugador desde el menú principal.
         if option == "Jugar":
+            self._leave_multiplayer_mode()
             self.state = "song_select"
             self._show_command_feedback("Menu de canciones listo")
+        elif option == "Multijugador":
+            self.state = "multiplayer_menu"
+            self.multiplayer_menu_index = 0
+            self._show_command_feedback("Elige crear sala o unirte")
         elif option == "Tutorial":
+            self._leave_multiplayer_mode()
             self._open_confirmation("start_tutorial", "main_menu")
         elif option == "Calibrar":
             self._run_calibration_flow()
@@ -1568,7 +1887,21 @@ class RhythmGame:
         elif option == "Salir":
             self.running = False
 
+    def _activate_multiplayer_menu_option(self, option: str):
+        # Este cambio arranca el lobby host o el formulario para conectarse por IP en la LAN.
+        if option == "Crear sala":
+            self._start_multiplayer_host()
+        elif option == "Unirse":
+            self.multiplayer_join_ip = self.multiplayer_local_ip
+            self.state = "multiplayer_join"
+            self._show_command_feedback("Escribe la IP del host y presiona ENTER")
+        elif option == "Volver":
+            self._leave_multiplayer_mode()
+            self._go_to_main_menu()
+
     def _start_tutorial_from_menu(self):
+        # Este cambio deja el tutorial como experiencia individual fuera del flujo competitivo.
+        self._leave_multiplayer_mode()
         for index, song in enumerate(self.song_library):
             if song.metadata and song.metadata.get("tutorial_mode") == "true":
                 self._apply_song_selection(index)
@@ -1581,6 +1914,7 @@ class RhythmGame:
         self._show_command_feedback("No encontre el tutorial")
 
     def _activate_pause_menu_option(self, option: str):
+        # Este cambio mantiene el menú de pausa compatible con futuras partidas de red.
         if option == "Continuar":
             self._resume_game()
         elif option == "Reiniciar":
@@ -1591,6 +1925,7 @@ class RhythmGame:
             self._open_exit_confirmation("return_to_song_select")
 
     def _activate_pause_difficulty_option(self, option: str):
+        # Este cambio mantiene el cambio de nivel disponible aunque la canción venga sincronizada por host.
         if option == "Facil":
             self._set_difficulty("easy")
             self._restart_current_song()
@@ -1604,6 +1939,7 @@ class RhythmGame:
             self.state = "paused"
 
     def _pause_game(self):
+        # Este cambio pausa solo la partida local sin cerrar la sesión multijugador.
         if self.state != "playing":
             return
         self.state = "paused"
@@ -1620,6 +1956,7 @@ class RhythmGame:
             pass
 
     def _resume_game(self):
+        # Este cambio reanuda la música y el reloj local después de una pausa.
         if self.state != "paused":
             return
         if self.pause_started_at is not None:
@@ -1637,6 +1974,7 @@ class RhythmGame:
             pass
 
     def _restart_current_song(self):
+        # Este cambio reinicia la canción manteniendo el mismo contexto local o multijugador.
         pygame.mixer.music.stop()
         try:
             self.vocals_channel.stop()
@@ -1649,18 +1987,22 @@ class RhythmGame:
         self._start_song()
 
     def _open_confirmation(self, context: str, return_state: str):
+        # Este cambio reutiliza la confirmación para tutorial y futuras acciones del lobby.
         self.return_state = return_state
         self.confirm_context = context
         self.confirm_index = 1
         self.state = "confirm"
 
     def _open_exit_confirmation(self, context: str):
+        # Este cambio mantiene un acceso compacto a la confirmación de salida.
         self._open_confirmation(context, "paused")
 
     def _cancel_confirmation(self):
+        # Este cambio devuelve al estado previo cuando el jugador cancela la acción.
         self.state = self.return_state
 
     def _resolve_confirmation(self, accepted: bool):
+        # Este cambio resuelve confirmaciones tanto del tutorial como de salidas a selector.
         if not accepted:
             self._cancel_confirmation()
             return
@@ -1671,11 +2013,13 @@ class RhythmGame:
             self._exit_to_song_select()
 
     def _go_to_main_menu(self):
+        # Este cambio centraliza el regreso al menú principal desde individual y multijugador.
         self.state = "main_menu"
         self.main_menu_index = 0
         self.command_buffer = ""
 
     def _exit_to_song_select(self):
+        # Este cambio limpia audio y temporizadores al salir de una canción hacia el selector.
         pygame.mixer.music.stop()
         try:
             self.vocals_channel.stop()
@@ -1692,7 +2036,141 @@ class RhythmGame:
         self.accumulated_pause_seconds = 0.0
         self.state = "song_select"
 
+    def _start_multiplayer_host(self):
+        # Este cambio abre una sala local y espera al rival antes de pasar al selector de canciones.
+        self._leave_multiplayer_mode()
+        try:
+            self.multiplayer_session.start_host(port=MULTIPLAYER_TCP_PORT)
+        except OSError:
+            self._show_command_feedback("No pude abrir el puerto multijugador")
+            return
+        self.multiplayer_mode = True
+        self.multiplayer_role = "host"
+        self.multiplayer_host_started = False
+        self.multiplayer_status = "Esperando a un rival..."
+        self.state = "multiplayer_host_lobby"
+        self._show_command_feedback(f"Sala creada en {self.multiplayer_local_ip}:{MULTIPLAYER_TCP_PORT}")
+
+    def _join_multiplayer_session(self, host_ip: str):
+        # Este cambio conecta al jugador remoto a la sala del host usando la IP escrita en el menú.
+        if not host_ip:
+            self._show_command_feedback("Escribe una IP valida")
+            return
+        self._leave_multiplayer_mode()
+        try:
+            self.multiplayer_session.join_host(host_ip, MULTIPLAYER_TCP_PORT)
+        except OSError:
+            self._show_command_feedback("No pude conectarme al host")
+            return
+        self.multiplayer_mode = True
+        self.multiplayer_role = "client"
+        self.multiplayer_host_started = False
+        self.state = "multiplayer_client_wait"
+        self.multiplayer_status = "Conectado. Esperando al host..."
+        self._show_command_feedback("Conectado al host")
+
+    def _leave_multiplayer_mode(self):
+        # Este cambio resetea toda la sesión competitiva cuando se abandona el lobby o la partida.
+        if self.multiplayer_session.connected:
+            self.multiplayer_session.send("disconnect")
+        self.multiplayer_session.close()
+        self.multiplayer_mode = False
+        self.multiplayer_role = None
+        self.multiplayer_status = "Modo individual activo"
+        self.multiplayer_remote_score = 0
+        self.multiplayer_remote_combo = 0
+        self.multiplayer_host_started = False
+
+    def _poll_multiplayer_network(self):
+        # Este cambio recibe eventos de red y actualiza el estado local del lobby o de la partida.
+        if not self.multiplayer_mode:
+            return
+        messages = self.multiplayer_session.poll_messages()
+        if not self.multiplayer_session.connected and self.multiplayer_role == "host" and self.state == "multiplayer_host_lobby":
+            return
+        if not self.multiplayer_session.connected and self.multiplayer_role == "host" and self.state in {"song_select", "playing", "paused", "finished", "failed"}:
+            self._show_command_feedback("El rival se desconecto")
+            self._leave_multiplayer_mode()
+            self.state = "song_select"
+            return
+        if not self.multiplayer_session.connected and self.multiplayer_role == "client":
+            self._show_command_feedback("Se perdio la conexion con el host")
+            self._leave_multiplayer_mode()
+            self._go_to_main_menu()
+            return
+        for payload in messages:
+            self._handle_multiplayer_packet(payload)
+        if self.multiplayer_role == "host" and self.multiplayer_session.connected and self.state == "multiplayer_host_lobby":
+            self.state = "song_select"
+            self.multiplayer_status = "Rival conectado. Elige la cancion"
+            self._send_multiplayer_lobby_state()
+
+    def _handle_multiplayer_packet(self, payload: dict):
+        # Este cambio interpreta los mensajes del rival para sincronizar lobby, canción e inicio.
+        packet_type = payload.get("type")
+        if packet_type == "hello" and self.multiplayer_role == "host":
+            self.multiplayer_status = "Rival conectado. Elige la cancion"
+            self._send_multiplayer_lobby_state()
+            return
+        if packet_type == "lobby_state" and self.multiplayer_role == "client":
+            self.multiplayer_status = payload.get("status", self.multiplayer_status)
+            song_index = payload.get("song_index")
+            difficulty = payload.get("difficulty")
+            if isinstance(song_index, int):
+                self._apply_song_selection(song_index)
+            if isinstance(difficulty, str):
+                self._set_difficulty(difficulty)
+            self.state = "song_select"
+            return
+        if packet_type == "start_game" and self.multiplayer_role == "client":
+            song_index = payload.get("song_index", self.selected_song_index)
+            difficulty = payload.get("difficulty", self.selected_difficulty)
+            start_epoch = float(payload.get("start_epoch", time.time() + START_DELAY_SECONDS))
+            self._apply_song_selection(song_index)
+            self._set_difficulty(difficulty)
+            self._start_song(start_epoch=max(0.35, start_epoch - time.time()))
+            self.multiplayer_host_started = True
+            return
+        if packet_type == "score_sync":
+            self.multiplayer_remote_score = int(payload.get("score", 0))
+            self.multiplayer_remote_combo = int(payload.get("combo", 0))
+            return
+        if packet_type == "disconnect":
+            self._show_command_feedback("El rival salio de la partida")
+            self._leave_multiplayer_mode()
+            self._go_to_main_menu()
+
+    def _send_multiplayer_lobby_state(self):
+        # Este cambio manda al cliente la canción y dificultad elegidas por el host en el selector.
+        if not self.multiplayer_mode or self.multiplayer_role != "host" or not self.multiplayer_session.connected:
+            return
+        self.multiplayer_session.send(
+            "lobby_state",
+            status=self.multiplayer_status,
+            song_index=self.selected_song_index,
+            difficulty=self.selected_difficulty,
+        )
+
+    def _send_multiplayer_score_sync(self, current_time: float):
+        # Este cambio comparte puntaje y combo en vivo para dar sensación competitiva básica.
+        if not self.multiplayer_mode or not self.multiplayer_session.connected or self.state != "playing":
+            return
+        if current_time - self.multiplayer_last_sync_sent_at < 0.20:
+            return
+        self.multiplayer_last_sync_sent_at = current_time
+        self.multiplayer_session.send("score_sync", score=self.score, combo=self.combo)
+
+    def _can_control_song_select(self):
+        # Este cambio decide si el selector lo controla el jugador local o si debe esperar al host.
+        return not self.multiplayer_mode or self.multiplayer_role == "host"
+
+    def _accepts_keyboard_hits(self):
+        # Este cambio deja el teclado como entrada principal del cliente remoto y opcional en individual.
+        return not self.multiplayer_mode or self.multiplayer_role == "client"
+
     def _run_calibration_flow(self):
+        # Este cambio mantiene la calibracion fuera del modo competitivo para no mezclar inputs de red.
+        self._leave_multiplayer_mode()
         self._show_command_feedback("Enviando señal de calibracion...")
         
         try:
@@ -1706,7 +2184,8 @@ class RhythmGame:
             
         self.state = "main_menu"
 
-    def _start_song(self):
+    def _start_song(self, start_epoch: float | None = None):
+        # Este cambio permite al host sincronizar el arranque y al cliente empezar con la misma cuenta atras.
         # --- PRECARGAR AUDIO ANTES DE INICIAR EL TIEMPO ---
         # Guardar estos textos estáticos como imágenes en la memoria
         self.cached_song_label = self.ui_font.render(f"{self.song_data.artist} - {self.song_data.title}", True, HUD_TEXT)
@@ -1743,9 +2222,19 @@ class RhythmGame:
                     continue
         # --------------------------------------------------
 
+        if self.multiplayer_mode and self.multiplayer_role == "host" and start_epoch is None:
+            start_epoch = time.time() + 2.0
+            self.multiplayer_session.send(
+                "start_game",
+                song_index=self.selected_song_index,
+                difficulty=self.selected_difficulty,
+                start_epoch=start_epoch,
+            )
+
         self.state = "playing"
         # ¡IMPORTANTE! El tiempo se calcula ahora DESPUÉS de cargar la memoria
-        self.song_started_at = (pygame.time.get_ticks() / 1000.0) + START_DELAY_SECONDS
+        delay_seconds = START_DELAY_SECONDS if start_epoch is None else max(0.35, start_epoch - time.time())
+        self.song_started_at = (pygame.time.get_ticks() / 1000.0) + delay_seconds
         self.music_started = False
         self.pause_started_at = None
         self.accumulated_pause_seconds = 0.0
@@ -1757,6 +2246,7 @@ class RhythmGame:
             note.judged = False
 
     def _restart_song(self):
+        # Este cambio devuelve al selector tras una partida terminada o cancelada.
         pygame.mixer.music.stop()
         try:
             self.vocals_channel.stop()
@@ -1783,6 +2273,7 @@ class RhythmGame:
         self.accumulated_pause_seconds = 0.0
 
     def _apply_song_selection(self, index: int):
+        # Este cambio envía al cliente la canción elegida cuando el host navega por el selector.
         if not self.song_library:
             return
 
@@ -1795,14 +2286,21 @@ class RhythmGame:
         self.vocals_sound = None
         self.rhythm_sound = None
         self.drums_sounds = []
+        if self.multiplayer_mode and self.multiplayer_role == "host" and self.state == "song_select":
+            self.multiplayer_status = "Host eligiendo cancion"
+            self._send_multiplayer_lobby_state()
 
     def _set_difficulty(self, difficulty_key: str):
+        # Este cambio replica la dificultad elegida por el host en el cliente conectado.
         if difficulty_key not in DIFFICULTY_PROFILES:
             return
         self.selected_difficulty = difficulty_key
         self._rebuild_notes_for_selected_difficulty()
+        if self.multiplayer_mode and self.multiplayer_role == "host" and self.state == "song_select":
+            self._send_multiplayer_lobby_state()
 
     def _cycle_difficulty(self, direction: int):
+        # Este cambio mantiene el ciclo de dificultad para individual y para el host de la sala.
         current_index = DIFFICULTY_ORDER.index(self.selected_difficulty)
         new_index = (current_index + direction) % len(DIFFICULTY_ORDER)
         self._set_difficulty(DIFFICULTY_ORDER[new_index])
@@ -1986,10 +2484,19 @@ class RhythmGame:
                 pass
 
     def _draw(self):
+        # Este cambio dibuja pantallas nuevas para crear sala, unirse y esperar al host.
         self._draw_background()
 
         if self.state == "main_menu":
             self._draw_main_menu()
+        elif self.state == "multiplayer_menu":
+            self._draw_multiplayer_menu()
+        elif self.state == "multiplayer_join":
+            self._draw_multiplayer_join()
+        elif self.state == "multiplayer_host_lobby":
+            self._draw_multiplayer_host_lobby()
+        elif self.state == "multiplayer_client_wait":
+            self._draw_multiplayer_client_wait()
         elif self.state == "song_select":
             self._draw_song_select()
         elif self.state == "playing":
@@ -2061,9 +2568,10 @@ class RhythmGame:
         self.screen.blit(panel, rect.topleft)
 
     def _draw_main_menu(self):
+        # Este cambio muestra la nueva opción de multijugador dentro del menú principal.
         title = self.title_font.render("AirDrums Hero", True, HUD_TEXT)
         subtitle = self.ui_font.render("Menu principal", True, HUD_TEXT)
-        helper = self.small_font.render("Di o escribe: Jugar, Calibrar, Creditos, Salir", True, HUD_TEXT)
+        helper = self.small_font.render("Di o escribe: Jugar, Multijugador, Tutorial, Calibrar, Creditos, Salir", True, HUD_TEXT)
 
         header_box = pygame.Rect(0, 0, min(620, WINDOW_WIDTH - 120), 120)
         header_box.center = (WINDOW_WIDTH // 2, 100)
@@ -2071,7 +2579,7 @@ class RhythmGame:
         self.screen.blit(title, title.get_rect(center=(header_box.centerx, header_box.y + 40)))
         self.screen.blit(subtitle, subtitle.get_rect(center=(header_box.centerx, header_box.y + 82)))
 
-        menu_box = pygame.Rect(0, 0, min(430, WINDOW_WIDTH - 180), 380)
+        menu_box = pygame.Rect(0, 0, min(430, WINDOW_WIDTH - 180), 430)
         menu_box.center = (WINDOW_WIDTH // 2, int(WINDOW_HEIGHT * 0.40))
         self._draw_panel(menu_box, fill_alpha=108, radius=24)
 
@@ -2088,16 +2596,105 @@ class RhythmGame:
         self._draw_panel(info_box, fill_alpha=98, radius=18)
         self.screen.blit(helper, helper.get_rect(center=(info_box.centerx, info_box.centery)))
 
+    def _draw_multiplayer_menu(self):
+        # Este cambio dibuja el submenu donde eliges si serás host o cliente en la red local.
+        title = self.title_font.render("Multijugador", True, HUD_TEXT)
+        subtitle = self.ui_font.render("1 vs 1 en la misma red", True, HUD_TEXT)
+        helper = self.small_font.render("Voz: crear sala, unirse, volver", True, HUD_TEXT)
+
+        header_box = pygame.Rect(0, 0, min(620, WINDOW_WIDTH - 120), 120)
+        header_box.center = (WINDOW_WIDTH // 2, 110)
+        self._draw_panel(header_box, fill_alpha=115, radius=24)
+        self.screen.blit(title, title.get_rect(center=(header_box.centerx, header_box.y + 40)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(header_box.centerx, header_box.y + 82)))
+
+        menu_box = pygame.Rect(0, 0, min(430, WINDOW_WIDTH - 180), 250)
+        menu_box.center = (WINDOW_WIDTH // 2, int(WINDOW_HEIGHT * 0.42))
+        self._draw_panel(menu_box, fill_alpha=108, radius=24)
+
+        for index, option in enumerate(self.multiplayer_menu_options):
+            option_rect = pygame.Rect(menu_box.x + 28, menu_box.y + 42 + (index * 62), menu_box.width - 56, 40)
+            if index == self.multiplayer_menu_index:
+                pygame.draw.rect(self.screen, (88, 76, 32), option_rect, border_radius=14)
+                pygame.draw.rect(self.screen, (255, 235, 130), option_rect, 2, border_radius=14)
+            option_surface = self.ui_font.render(option, True, HUD_TEXT)
+            self.screen.blit(option_surface, option_surface.get_rect(center=option_rect.center))
+
+        info_box = pygame.Rect(0, 0, min(780, WINDOW_WIDTH - 80), 96)
+        info_box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 220)
+        self._draw_panel(info_box, fill_alpha=98, radius=18)
+        self.screen.blit(helper, helper.get_rect(center=(info_box.centerx, info_box.y + 26)))
+        ip_hint = self.small_font.render(f"Tu IP local sugerida: {self.multiplayer_local_ip}:{MULTIPLAYER_TCP_PORT}", True, HUD_TEXT)
+        self.screen.blit(ip_hint, ip_hint.get_rect(center=(info_box.centerx, info_box.y + 58)))
+
+    def _draw_multiplayer_join(self):
+        # Este cambio dibuja la pantalla donde el cliente escribe la IP del host para conectarse.
+        title = self.title_font.render("Unirse a partida", True, HUD_TEXT)
+        subtitle = self.ui_font.render("Escribe la IP del host", True, HUD_TEXT)
+
+        box = pygame.Rect(0, 0, min(760, WINDOW_WIDTH - 120), 260)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 20)
+        self._draw_panel(box, fill_alpha=120, radius=24)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 46)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(box.centerx, box.y + 92)))
+
+        input_rect = pygame.Rect(box.x + 60, box.y + 126, box.width - 120, 44)
+        pygame.draw.rect(self.screen, (30, 30, 40), input_rect, border_radius=12)
+        pygame.draw.rect(self.screen, (240, 215, 120), input_rect, 2, border_radius=12)
+        ip_surface = self.ui_font.render(self.multiplayer_join_ip or "127.0.0.1", True, HUD_TEXT)
+        self.screen.blit(ip_surface, ip_surface.get_rect(midleft=(input_rect.x + 16, input_rect.centery)))
+
+        helper = self.small_font.render("ENTER conecta | ESC vuelve atras", True, HUD_TEXT)
+        self.screen.blit(helper, helper.get_rect(center=(box.centerx, box.bottom - 36)))
+
+    def _draw_multiplayer_host_lobby(self):
+        # Este cambio muestra la sala creada y el estado de espera del jugador remoto.
+        title = self.title_font.render("Sala creada", True, HUD_TEXT)
+        subtitle = self.ui_font.render("Comparte esta IP con tu rival", True, HUD_TEXT)
+
+        box = pygame.Rect(0, 0, min(760, WINDOW_WIDTH - 120), 280)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 30)
+        self._draw_panel(box, fill_alpha=122, radius=24)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 44)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(box.centerx, box.y + 90)))
+
+        ip_text = self.ui_font.render(f"{self.multiplayer_local_ip}:{MULTIPLAYER_TCP_PORT}", True, (255, 235, 130))
+        self.screen.blit(ip_text, ip_text.get_rect(center=(box.centerx, box.y + 138)))
+        status = self.small_font.render(self.multiplayer_status, True, HUD_TEXT)
+        self.screen.blit(status, status.get_rect(center=(box.centerx, box.y + 182)))
+
+        helper_text = "Voz: jugar para seguir" if self.multiplayer_session.connected else "Esperando conexion del cliente..."
+        helper = self.small_font.render(helper_text, True, HUD_TEXT)
+        self.screen.blit(helper, helper.get_rect(center=(box.centerx, box.bottom - 42)))
+
+    def _draw_multiplayer_client_wait(self):
+        # Este cambio avisa al cliente que ya entró y debe esperar a que el host controle la partida.
+        title = self.title_font.render("Conectado al host", True, HUD_TEXT)
+        subtitle = self.ui_font.render("Esperando a que el host inicie el juego", True, HUD_TEXT)
+
+        box = pygame.Rect(0, 0, min(760, WINDOW_WIDTH - 120), 240)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 20)
+        self._draw_panel(box, fill_alpha=122, radius=24)
+        self.screen.blit(title, title.get_rect(center=(box.centerx, box.y + 50)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(box.centerx, box.y + 102)))
+        status = self.small_font.render(self.multiplayer_status, True, HUD_TEXT)
+        self.screen.blit(status, status.get_rect(center=(box.centerx, box.y + 150)))
+        helper = self.small_font.render("Voz: volver para cancelar la conexion", True, HUD_TEXT)
+        self.screen.blit(helper, helper.get_rect(center=(box.centerx, box.bottom - 38)))
+
     def _draw_song_select(self):
+        # Este cambio adapta el selector para que el cliente espere y solo el host pueda cambiar la canción.
         title = self.title_font.render("AirDrums Hero", True, HUD_TEXT)
         subtitle = self.ui_font.render(f"{self.song_data.artist} - {self.song_data.title}", True, HUD_TEXT)
-        hint = self.ui_font.render("ENTER para empezar", True, HUD_TEXT)
+        hint_text = "ENTER para empezar" if self._can_control_song_select() else "Esperando a que el host inicie"
+        hint = self.ui_font.render(hint_text, True, HUD_TEXT)
         source = self.small_font.render(f"Chart: {self.song_data.source_name}", True, HUD_TEXT)
         kick_text = "Usando chart PART DRUMS (bateria)"
         kick_hint = self.small_font.render(kick_text, True, HUD_TEXT)
         difficulty_label = DIFFICULTY_PROFILES[self.selected_difficulty].label
+        difficulty_voice = "Facil, Medio, Dificil" if self._can_control_song_select() else "Solo host controla"
         difficulty_hint = self.small_font.render(
-            f"Dificultad: {difficulty_label}  |  Voz: Facil, Medio, Dificil",
+            f"Dificultad: {difficulty_label}  |  Voz: {difficulty_voice}",
             True,
             HUD_TEXT,
         )
@@ -2138,10 +2735,11 @@ class RhythmGame:
             text_surface = self.tiny_font.render(text[:40], True, HUD_TEXT)
             self.screen.blit(text_surface, (selector_box.x + 20, item_y))
 
-        footer_box = pygame.Rect(28, WINDOW_HEIGHT - 250, WINDOW_WIDTH - 56, 118)
+        footer_box = pygame.Rect(28, WINDOW_HEIGHT - 266, WINDOW_WIDTH - 56, 144)
         self._draw_panel(footer_box, fill_alpha=105, radius=20)
         self.screen.blit(hint, hint.get_rect(center=(footer_box.centerx, footer_box.y + 28)))
-        nav_hint = self.small_font.render("Flechas arriba/abajo para elegir cancion", True, HUD_TEXT)
+        nav_text = "Flechas arriba/abajo para elegir cancion" if self._can_control_song_select() else "El host esta eligiendo la cancion"
+        nav_hint = self.small_font.render(nav_text, True, HUD_TEXT)
         self.screen.blit(nav_hint, nav_hint.get_rect(center=(footer_box.centerx, footer_box.y + 56)))
         self.screen.blit(difficulty_hint, difficulty_hint.get_rect(center=(footer_box.centerx, footer_box.y + 80)))
         compact_info = self.small_font.render(
@@ -2156,6 +2754,13 @@ class RhythmGame:
                 HUD_TEXT,
             )
         self.screen.blit(compact_info, compact_info.get_rect(center=(footer_box.centerx, footer_box.y + 102)))
+        if self.multiplayer_mode:
+            network_hint = self.small_font.render(
+                f"Modo red: {'Host' if self.multiplayer_role == 'host' else 'Cliente'} | {self.multiplayer_status}",
+                True,
+                HUD_TEXT,
+            )
+            self.screen.blit(network_hint, network_hint.get_rect(center=(footer_box.centerx, footer_box.y + 124)))
 
     def _draw_playfield(self):
         highway_width = min(900, max(760, int(WINDOW_WIDTH * 0.86)))
@@ -2306,6 +2911,7 @@ class RhythmGame:
         self.screen.blit(heard, (bar_rect.x + 12, bar_rect.y + 31))
 
     def _draw_hud(self, highway_rect: pygame.Rect):
+        # Este cambio añade un panel simple del rival para que el modo 1 vs 1 tenga feedback competitivo.
         left_panel = pygame.Rect(18, 18, 248, 220)
         self._draw_panel(left_panel, fill_alpha=110, radius=20)
 
@@ -2347,6 +2953,21 @@ class RhythmGame:
         self._draw_panel(bottom_panel, fill_alpha=96, radius=14)
         port_surface = self.small_font.render("Recibiendo golpes UDP 5053", True, HUD_TEXT)
         self.screen.blit(port_surface, (bottom_panel.x + 12, bottom_panel.y + 6))
+        if self.multiplayer_mode:
+            rival_panel = pygame.Rect(max(18, WINDOW_WIDTH - 320), 18, 300, 110)
+            self._draw_panel(rival_panel, fill_alpha=104, radius=18)
+            rival_title = self.small_font.render(self.multiplayer_remote_name, True, HUD_TEXT)
+            rival_score = self.small_font.render(f"Score rival: {self.multiplayer_remote_score}", True, HUD_TEXT)
+            rival_combo = self.small_font.render(f"Combo rival: {self.multiplayer_remote_combo}", True, HUD_TEXT)
+            rival_mode = self.small_font.render(
+                f"Tu rol: {'Host / Baquetas' if self.multiplayer_role == 'host' else 'Cliente / Teclado'}",
+                True,
+                HUD_TEXT,
+            )
+            self.screen.blit(rival_title, (rival_panel.x + 16, rival_panel.y + 14))
+            self.screen.blit(rival_score, (rival_panel.x + 16, rival_panel.y + 40))
+            self.screen.blit(rival_combo, (rival_panel.x + 16, rival_panel.y + 62))
+            self.screen.blit(rival_mode, (rival_panel.x + 16, rival_panel.y + 84))
 
     def _draw_health_meter(self, highway_rect: pygame.Rect):
         meter_height = min(250, max(190, int(highway_rect.height * 0.42)))

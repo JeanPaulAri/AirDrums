@@ -8,6 +8,7 @@ import configparser
 import importlib.util
 import json
 import math
+import random
 import socket
 import subprocess
 import sys
@@ -109,8 +110,16 @@ KEYBOARD_ZONE_MAP = {
     pygame.K_F3: "tarola",
     pygame.K_F4: "tom superior",
     pygame.K_F5: "tom inferior",
-    pygame.K_SPACE: "bombo",
 }
+POWER_EFFECT_DURATION_SECONDS = 6.0
+POWER_DEFINITIONS = {
+    "double_notes": {"label": "x2 Notas", "color": (255, 176, 92)},
+    "invert_colors": {"label": "Invertir", "color": (110, 205, 255)},
+    "hide_notes": {"label": "Ocultar", "color": (186, 124, 255)},
+}
+POWER_PHRASE_LENGTH_GUITAR = 12
+POWER_PHRASE_COUNT_MIN = 3
+POWER_PHRASE_COUNT_MAX = 4
 
 # Mapas de notas MIDI (expert) a zonas.
 GUITAR_EXPERT_MAP = {
@@ -138,6 +147,7 @@ class Note:
     zone: str
     hit: bool = False
     judged: bool = False
+    power_phrase_id: int | None = None
 
 
 @dataclass
@@ -883,7 +893,7 @@ class SongLoader:
         return kicks
 
     def _clone_notes(self, notes):
-        return [Note(time=note.time, zone=note.zone) for note in notes]
+        return [Note(time=note.time, zone=note.zone, power_phrase_id=note.power_phrase_id) for note in notes]
 
     def build_playable_notes(self, base_notes, difficulty_key):
         profile = DIFFICULTY_PROFILES.get(difficulty_key, DIFFICULTY_PROFILES["easy"])
@@ -1296,7 +1306,11 @@ class RhythmGame:
         self.multiplayer_join_ip = ""
         self.multiplayer_remote_score = 0
         self.multiplayer_remote_combo = 0
+        self.multiplayer_remote_health = 0.50
+        self.multiplayer_remote_display_health = 0.50
         self.multiplayer_remote_name = "Rival"
+        self.multiplayer_remote_powers = []
+        self.multiplayer_remote_effects = []
         self.multiplayer_last_sync_sent_at = 0.0
         self.multiplayer_local_ip = self.multiplayer_session.get_local_ip()
         self.multiplayer_host_started = False
@@ -1313,6 +1327,9 @@ class RhythmGame:
         self.last_judgement = "Listo para tocar"
         self.failure_started_at = None
         self.failed_message = ""
+        self.available_powers = []
+        self.active_power_effects = {}
+        self.power_phrase_states = {}
         if "microfono" in self.voice_backend_name.lower():
             self.command_feedback = "Voz activa: menu o pausa en partida; jugar, calibrar, creditos, salir"
         elif "micro no configurado" in self.voice_backend_name.lower():
@@ -1524,6 +1541,9 @@ class RhythmGame:
                     self._resolve_confirmation(self.confirm_options[self.confirm_index] == "Si")
                     continue
 
+                if self.state == "playing" and event.key == pygame.K_SPACE:
+                    self._use_next_power()
+                    continue
                 zone = KEYBOARD_ZONE_MAP.get(event.key)
                 if zone and self.state == "playing" and self._accepts_keyboard_hits():
                     self._register_hit(zone)
@@ -1532,6 +1552,8 @@ class RhythmGame:
         # Este cambio procesa la red local y sincroniza el lobby antes de actualizar la partida.
         current_time = pygame.time.get_ticks() / 1000.0
         self.display_health += (self.health - self.display_health) * min(1.0, dt * 8.0)
+        self.multiplayer_remote_display_health += (self.multiplayer_remote_health - self.multiplayer_remote_display_health) * min(1.0, dt * 8.0)
+        self._cleanup_expired_power_effects(current_time)
 
         if self.command_feedback_until and current_time > self.command_feedback_until:
             self.command_feedback_until = 0.0
@@ -2105,6 +2127,10 @@ class RhythmGame:
         self.multiplayer_status = "Modo individual activo"
         self.multiplayer_remote_score = 0
         self.multiplayer_remote_combo = 0
+        self.multiplayer_remote_health = 0.50
+        self.multiplayer_remote_display_health = 0.50
+        self.multiplayer_remote_powers = []
+        self.multiplayer_remote_effects = []
         self.multiplayer_host_started = False
 
     def _poll_multiplayer_network(self):
@@ -2173,17 +2199,27 @@ class RhythmGame:
             
         if packet_type == "client_ready" and self.multiplayer_role == "host":
             if self.state == "waiting_for_client_ready":
-                self.multiplayer_session.send("start_countdown")
-                self._start_song(delay_seconds=3.0)
+                start_epoch = time.time() + 3.0
+                self.multiplayer_session.send("start_countdown", start_epoch=start_epoch)
+                self._start_song(start_epoch=start_epoch)
             return
 
         if packet_type == "start_countdown" and self.multiplayer_role == "client":
             if self.state == "waiting_for_host_ready":
-                self._start_song(delay_seconds=3.0)
+                start_epoch = float(payload.get("start_epoch", time.time() + 3.0))
+                self._start_song(start_epoch=start_epoch)
             return
         if packet_type == "score_sync":
             self.multiplayer_remote_score = int(payload.get("score", 0))
             self.multiplayer_remote_combo = int(payload.get("combo", 0))
+            self.multiplayer_remote_health = float(payload.get("health", self.multiplayer_remote_health))
+            self.multiplayer_remote_powers = list(payload.get("powers", self.multiplayer_remote_powers))
+            self.multiplayer_remote_effects = list(payload.get("effects", self.multiplayer_remote_effects))
+            return
+        if packet_type == "power_used":
+            power_name = payload.get("power")
+            if isinstance(power_name, str):
+                self._apply_power_effect(power_name)
             return
         if packet_type == "surrender":
             action_type = payload.get("action", "exit")
@@ -2216,7 +2252,14 @@ class RhythmGame:
         if current_time - self.multiplayer_last_sync_sent_at < 0.20:
             return
         self.multiplayer_last_sync_sent_at = current_time
-        self.multiplayer_session.send("score_sync", score=self.score, combo=self.combo)
+        self.multiplayer_session.send(
+            "score_sync",
+            score=self.score,
+            combo=self.combo,
+            health=round(self.health, 3),
+            powers=self.available_powers,
+            effects=list(self.active_power_effects.keys()),
+        )
 
     def _can_control_song_select(self):
         # Este cambio decide si el selector lo controla el jugador local o si debe esperar al host.
@@ -2291,9 +2334,11 @@ class RhythmGame:
             self._load_song_assets()
             self._start_song(delay_seconds=3.0)
 
-    def _start_song(self, delay_seconds: float = 3.0):
+    def _start_song(self, delay_seconds: float = 3.0, start_epoch: float | None = None):
         self.state = "playing"
-        # Iniciamos un margen futuro de 3 segundos exactos.
+        # Este cambio usa un tiempo absoluto compartido para que host y cliente arranquen sincronizados.
+        if start_epoch is not None:
+            delay_seconds = max(0.0, start_epoch - time.time())
         self.song_started_at = (pygame.time.get_ticks() / 1000.0) + delay_seconds
         self.music_started = False
         self.pause_started_at = None
@@ -2366,9 +2411,11 @@ class RhythmGame:
         self._set_difficulty(DIFFICULTY_ORDER[new_index])
 
     def _rebuild_notes_for_selected_difficulty(self):
+        # Este cambio marca frases reales del chart de guitarra para otorgar poderes al completarlas.
         if self.song_data is None:
             return
         self.notes = self.song_loader.build_playable_notes(self.song_data.base_notes, self.selected_difficulty)
+        self._assign_power_phrases(self.notes, POWER_PHRASE_LENGTH_GUITAR)
         self.song_data.notes = self.notes
 
     def _reset_run_stats(self):
@@ -2384,6 +2431,10 @@ class RhythmGame:
         self.failure_started_at = None
         self.failed_message = ""
         self.pause_started_at = None
+        self.available_powers = []
+        self.active_power_effects = {}
+        self.power_phrase_states = {}
+        self._reset_power_phrase_progress()
 
     def _current_profile(self):
         return DIFFICULTY_PROFILES[self.selected_difficulty]
@@ -2439,8 +2490,6 @@ class RhythmGame:
 
         self.music_started = True
 
-        self.song_started_at = pygame.time.get_ticks() / 1000.0 
-
     def _register_hit(self, zone: str):
         """Registra un golpe del usuario y evalúa timing/score."""
         if self.song_started_at is None or self.state != "playing":
@@ -2487,6 +2536,7 @@ class RhythmGame:
         self.last_judgement = "Perfecto" if abs(candidate_offset) < 0.075 else "Bien"        
         self.last_hit_zone = zone
         self.last_hit_at = current_time
+        self._track_power_sequence(candidate)
 
     def _has_upcoming_note(self, zone: str, song_time: float):
         for note in self.notes:
@@ -2503,6 +2553,7 @@ class RhythmGame:
             if song_time - note.time > LATE_HIT_WINDOW_SECONDS:
                 note.judged = True
                 note.hit = False
+                self._register_power_phrase_miss(note)
                 self.combo = 0
                 self.miss_streak += 1
                 self._change_health(-self._current_profile().health_loss_miss)
@@ -2513,6 +2564,107 @@ class RhythmGame:
 
     def _change_health(self, delta: float):
         self.health = max(0.0, min(1.0, self.health + delta))
+
+    def _assign_power_phrases(self, notes: list[Note], phrase_length: int):
+        # Este cambio selecciona tramos reales del chart de guitarra y los marca como frases de poder.
+        for note in notes:
+            note.power_phrase_id = None
+        if len(notes) < phrase_length:
+            return
+        candidate_indices = []
+        for start_index in range(0, len(notes) - phrase_length + 1):
+            phrase_notes = notes[start_index:start_index + phrase_length]
+            if phrase_notes[-1].time - phrase_notes[0].time > 8.0:
+                continue
+            candidate_indices.append(start_index)
+        if not candidate_indices:
+            return
+        phrase_count = POWER_PHRASE_COUNT_MAX if len(candidate_indices) >= POWER_PHRASE_COUNT_MAX else min(POWER_PHRASE_COUNT_MIN, len(candidate_indices))
+        phrase_count = max(1, phrase_count)
+        picker = random.Random(f"{self.song_data.title}|{self.selected_difficulty}|guitar")
+        selected_starts = []
+        bucket_size = max(1, len(candidate_indices) // phrase_count)
+        for bucket_index in range(phrase_count):
+            bucket_start = bucket_index * bucket_size
+            bucket_end = len(candidate_indices) if bucket_index == phrase_count - 1 else min(len(candidate_indices), bucket_start + bucket_size)
+            bucket = [index for index in candidate_indices[bucket_start:bucket_end] if all(abs(index - chosen) >= phrase_length for chosen in selected_starts)]
+            if not bucket:
+                continue
+            selected_starts.append(picker.choice(bucket))
+        for phrase_id, start_index in enumerate(sorted(selected_starts)):
+            for note in notes[start_index:start_index + phrase_length]:
+                note.power_phrase_id = phrase_id
+
+    def _reset_power_phrase_progress(self):
+        # Este cambio prepara el seguimiento de las frases especiales antes de iniciar la canción.
+        self.power_phrase_states = {}
+        for note in self.notes:
+            if note.power_phrase_id is None:
+                continue
+            state = self.power_phrase_states.setdefault(note.power_phrase_id, {"total": 0, "hits": 0, "failed": False, "awarded": False})
+            state["total"] += 1
+
+    def _track_power_sequence(self, note: Note):
+        # Este cambio valida si la frase especial de guitarra fue completada con éxito.
+        if note.power_phrase_id is None:
+            return
+        state = self.power_phrase_states.get(note.power_phrase_id)
+        if state is None or state["failed"] or state["awarded"]:
+            return
+        state["hits"] += 1
+        if state["hits"] >= state["total"]:
+            state["awarded"] = True
+            self._award_random_power()
+
+    def _register_power_phrase_miss(self, note: Note):
+        # Este cambio cancela la recompensa si el jugador falla una nota de la frase especial.
+        if note.power_phrase_id is None:
+            return
+        state = self.power_phrase_states.get(note.power_phrase_id)
+        if state is not None:
+            state["failed"] = True
+
+    def _award_power(self, power_name: str):
+        # Este cambio agrega el poder ganado al inventario local visible para ambos jugadores.
+        if len(self.available_powers) >= 3:
+            self.available_powers.pop(0)
+        self.available_powers.append(power_name)
+        self._show_command_feedback(f"Poder ganado: {POWER_DEFINITIONS[power_name]['label']}")
+
+    def _award_random_power(self):
+        # Este cambio entrega un poder aleatorio cuando completas una frase real de la canción.
+        self._award_power(random.choice(list(POWER_DEFINITIONS.keys())))
+
+    def _use_next_power(self):
+        # Este cambio permite lanzar el siguiente poder equipado con SPACE en el juego de guitarra.
+        if self.state != "playing":
+            return
+        if not self.available_powers:
+            self._show_command_feedback("No tienes poderes cargados")
+            return
+        power_name = self.available_powers.pop(0)
+        if self.multiplayer_mode and self.multiplayer_session.connected:
+            self.multiplayer_session.send("power_used", power=power_name)
+        self._show_command_feedback(f"Poder lanzado: {POWER_DEFINITIONS[power_name]['label']}")
+
+    def _apply_power_effect(self, power_name: str, current_time: float | None = None):
+        # Este cambio activa un debuff temporal sobre la pantalla local cuando el rival usa un poder.
+        if power_name not in POWER_DEFINITIONS:
+            return
+        if current_time is None:
+            current_time = pygame.time.get_ticks() / 1000.0
+        self.active_power_effects[power_name] = current_time + POWER_EFFECT_DURATION_SECONDS
+        self._show_command_feedback(f"Te lanzaron: {POWER_DEFINITIONS[power_name]['label']}")
+
+    def _cleanup_expired_power_effects(self, current_time: float):
+        # Este cambio elimina efectos vencidos para que el HUD y la pista vuelvan a la normalidad.
+        expired_powers = [name for name, end_time in self.active_power_effects.items() if current_time >= end_time]
+        for power_name in expired_powers:
+            self.active_power_effects.pop(power_name, None)
+
+    def _has_active_power_effect(self, power_name: str):
+        # Este cambio simplifica consultar si un efecto de poder sigue activo.
+        return power_name in self.active_power_effects
 
     def _check_fail_state(self):
         profile = self._current_profile()
@@ -3060,7 +3212,7 @@ class RhythmGame:
 
     def _draw_hud(self, highway_rect: pygame.Rect):
         # Este cambio añade un panel simple del rival para que el modo 1 vs 1 tenga feedback competitivo.
-        left_panel = pygame.Rect(18, 18, 248, 220)
+        left_panel = pygame.Rect(18, 18, 270, 252)
         self._draw_panel(left_panel, fill_alpha=110, radius=20)
 
         score_surface = self.ui_font.render(f"Score {self.score}", True, HUD_TEXT)
@@ -3094,8 +3246,7 @@ class RhythmGame:
         else:
             self.screen.blit(song_surface, (32, 186))
             self.screen.blit(artist_surface, (32, 208))
-
-        self._draw_health_meter(highway_rect)
+        self._draw_health_meter(highway_rect, side="left", health_value=self.display_health, powers=self.available_powers, active_effects=list(self.active_power_effects.keys()), owner_label="Tu vida")
 
         bottom_panel = pygame.Rect(max(18, WINDOW_WIDTH - 320), WINDOW_HEIGHT - 380, 300, 30)
         self._draw_panel(bottom_panel, fill_alpha=96, radius=14)
@@ -3116,10 +3267,20 @@ class RhythmGame:
             self.screen.blit(rival_score, (rival_panel.x + 16, rival_panel.y + 40))
             self.screen.blit(rival_combo, (rival_panel.x + 16, rival_panel.y + 62))
             self.screen.blit(rival_mode, (rival_panel.x + 16, rival_panel.y + 84))
+            self._draw_health_meter(
+                highway_rect,
+                side="right",
+                health_value=self.multiplayer_remote_display_health,
+                powers=self.multiplayer_remote_powers,
+                active_effects=self.multiplayer_remote_effects,
+                owner_label="Vida rival",
+            )
 
-    def _draw_health_meter(self, highway_rect: pygame.Rect):
+    def _draw_health_meter(self, highway_rect: pygame.Rect, side: str, health_value: float, powers: list[str], active_effects: list[str], owner_label: str):
+        # Este cambio dibuja la vida y los poderes de ambos jugadores sin tapar la pista principal.
         meter_height = min(250, max(190, int(highway_rect.height * 0.42)))
-        shell_rect = pygame.Rect(12, 270, 42, meter_height)
+        shell_x = 12 if side == "left" else WINDOW_WIDTH - 54
+        shell_rect = pygame.Rect(shell_x, 270, 42, meter_height)
         shell_points = [
             (shell_rect.x + 12, shell_rect.y),
             (shell_rect.right, shell_rect.y + 10),
@@ -3148,7 +3309,7 @@ class RhythmGame:
             height = max(1, int(meter_rect.height * (end_ratio - start_ratio)))
             pygame.draw.rect(self.screen, color, pygame.Rect(meter_rect.x, top, meter_rect.width, height))
 
-        fill_height = int(meter_rect.height * self.display_health)
+        fill_height = int(meter_rect.height * health_value)
         empty_height = meter_rect.height - fill_height
         if empty_height > 0:
             empty_rect = pygame.Rect(meter_rect.x, meter_rect.y, meter_rect.width, empty_height)
@@ -3161,7 +3322,7 @@ class RhythmGame:
         pygame.draw.rect(glow, (255, 245, 205, 42), glow.get_rect())
         self.screen.blit(glow, glow_rect.topleft)
 
-        marker_y = meter_rect.bottom - int(meter_rect.height * self.display_health)
+        marker_y = meter_rect.bottom - int(meter_rect.height * health_value)
         pygame.draw.line(
             self.screen,
             (255, 255, 255),
@@ -3170,11 +3331,34 @@ class RhythmGame:
             3,
         )
 
-        label = self.small_font.render("Vida", True, HUD_TEXT)
+        label = self.small_font.render(owner_label, True, HUD_TEXT)
         self.screen.blit(label, label.get_rect(center=(shell_rect.centerx + 2, shell_rect.y - 14)))
+        self._draw_power_slots(shell_rect, side, powers, active_effects)
+
+    def _draw_power_slots(self, shell_rect: pygame.Rect, side: str, powers: list[str], active_effects: list[str]):
+        # Este cambio enseña solo los poderes disponibles y elimina casillas vacías confusas.
+        power_x = shell_rect.right + 14 if side == "left" else shell_rect.x - 122
+        active_set = set(active_effects)
+        if not powers:
+            empty_rect = pygame.Rect(power_x, shell_rect.y + 18, 108, 40)
+            self._draw_panel(empty_rect, fill_alpha=70, radius=12)
+            empty_surface = self.tiny_font.render("Sin poderes", True, (170, 170, 170))
+            self.screen.blit(empty_surface, empty_surface.get_rect(center=empty_rect.center))
+            return
+        for index, power_name in enumerate(powers[:3]):
+            slot_rect = pygame.Rect(power_x, shell_rect.y + 18 + (index * 56), 108, 40)
+            self._draw_panel(slot_rect, fill_alpha=92, radius=12)
+            power_info = POWER_DEFINITIONS.get(power_name, {"label": power_name, "color": HUD_TEXT})
+            color = power_info["color"]
+            if power_name in active_set:
+                pygame.draw.rect(self.screen, (*color, 255), slot_rect, 2, border_radius=12)
+            label_surface = self.tiny_font.render(power_info["label"][:13], True, color)
+            self.screen.blit(label_surface, label_surface.get_rect(center=slot_rect.center))
 
     def _draw_highway(self, rect: pygame.Rect, preview_time: float, show_song_banner: bool):
+        # Este cambio aplica los poderes visuales también en el tablero de guitarra para que ambos sientan el efecto.
         preview_lead = self._current_preview_lead()
+        active_lane_colors = list(LANE_COLORS[::-1] if self._has_active_power_effect("invert_colors") else LANE_COLORS)
         top_width = rect.width * 0.36
         bottom_width = rect.width * 0.98
         top_center_x = rect.centerx
@@ -3247,7 +3431,7 @@ class RhythmGame:
         #    Pintaremos una Surface compartida
         self.blank_surface.fill((0, 0, 0, 0))
 
-        for lane_index, color in enumerate(LANE_COLORS):
+        for lane_index, color in enumerate(active_lane_colors):
             left_ratio = lane_index / 5
             right_ratio = (lane_index + 1) / 5
             lane_poly = [
@@ -3287,7 +3471,7 @@ class RhythmGame:
         kick_right = self._point_on_width(left_top, left_bottom, right_top, right_bottom, kick_y, 1.0)
         pygame.draw.line(self.screen, (130, 130, 130), kick_left, kick_right, 10)
 
-        for lane_index, color in enumerate(LANE_COLORS):
+        for lane_index, color in enumerate(active_lane_colors):
             lane_x = self._lane_center_x(left_top, left_bottom, right_top, right_bottom, strike_y, lane_index)
             radius = 28
             is_pressed = self._was_recent_zone_hit(self._lane_zone(lane_index))
@@ -3298,6 +3482,9 @@ class RhythmGame:
         kick_pressed = self._was_recent_zone_hit("bombo")
         active_kick_color = KICK_COLOR_PRESSED if kick_pressed else KICK_COLOR
         pygame.draw.line(self.screen, active_kick_color, kick_left, kick_right, 12)
+
+        hide_notes_active = self._has_active_power_effect("hide_notes")
+        double_notes_active = self._has_active_power_effect("double_notes")
 
         for note in self.notes:
             if note.judged and not note.hit:
@@ -3312,24 +3499,44 @@ class RhythmGame:
             travel_progress = progress ** NOTE_TRAVEL_CURVE
 
             if note.zone == "bombo":
+                if hide_notes_active:
+                    continue
                 y = top_y + ((kick_y - top_y) * travel_progress)
                 kick_note_left = self._point_on_width(left_top, left_bottom, right_top, right_bottom, y, 0.0)
                 kick_note_right = self._point_on_width(left_top, left_bottom, right_top, right_bottom, y, 1.0)
                 color = (255, 255, 255) if not note.hit else (255, 240, 190)
-                pygame.draw.line(
-                    self.screen,
-                    color,
-                    kick_note_left,
-                    kick_note_right,
-                    max(5, int(4 + (progress * 10))),
-                )
+                line_width = max(5, int(4 + (progress * 10)))
+                if note.power_phrase_id is None:
+                    pygame.draw.line(self.screen, color, kick_note_left, kick_note_right, line_width)
+                else:
+                    dash_count = 7
+                    for dash_index in range(dash_count):
+                        start_progress = dash_index / dash_count
+                        end_progress = min(1.0, start_progress + 0.08)
+                        dash_start = (
+                            int(kick_note_left[0] + ((kick_note_right[0] - kick_note_left[0]) * start_progress)),
+                            int(kick_note_left[1] + ((kick_note_right[1] - kick_note_left[1]) * start_progress)),
+                        )
+                        dash_end = (
+                            int(kick_note_left[0] + ((kick_note_right[0] - kick_note_left[0]) * end_progress)),
+                            int(kick_note_left[1] + ((kick_note_right[1] - kick_note_left[1]) * end_progress)),
+                        )
+                        pygame.draw.line(self.screen, color, dash_start, dash_end, line_width)
+                    pygame.draw.line(self.screen, (255, 255, 255), kick_note_left, kick_note_right, 2)
+                if double_notes_active:
+                    offset_y = min(kick_y, y + 18)
+                    clone_left = self._point_on_width(left_top, left_bottom, right_top, right_bottom, offset_y, 0.0)
+                    clone_right = self._point_on_width(left_top, left_bottom, right_top, right_bottom, offset_y, 1.0)
+                    pygame.draw.line(self.screen, (*KICK_COLOR_PRESSED[:3],), clone_left, clone_right, max(4, int(3 + (progress * 7))))
                 continue
 
+            if hide_notes_active:
+                continue
             lane_index = ZONE_TO_LANE[note.zone]
             y = top_y + ((strike_y - top_y) * travel_progress)
             lane_x = self._lane_center_x(left_top, left_bottom, right_top, right_bottom, y, lane_index)
             radius = max(12, int(12 + (progress * 18)))
-            color = LANE_COLORS[lane_index]
+            color = active_lane_colors[lane_index]
             fill = color if not note.hit else (255, 246, 185)
             
             # --- 4. OPTIMIZACIÓN DE SOMBRA CLONADA DE NOTA
@@ -3350,8 +3557,33 @@ class RhythmGame:
             
             self.screen.blit(shadow_surface_cached, (int(lane_x) - shadow_radius_cached - 4, int(y) - shadow_radius_cached - 4))
             # ---------------------------------------------
-            pygame.draw.circle(self.screen, fill, (int(lane_x), int(y)), radius)
-            pygame.draw.circle(self.screen, (240, 240, 240), (int(lane_x), int(y)), radius, 3)
+            if note.power_phrase_id is None:
+                pygame.draw.circle(self.screen, fill, (int(lane_x), int(y)), radius)
+                pygame.draw.circle(self.screen, (240, 240, 240), (int(lane_x), int(y)), radius, 3)
+            else:
+                diamond_points = [
+                    (int(lane_x), int(y - radius - 2)),
+                    (int(lane_x + radius + 2), int(y)),
+                    (int(lane_x), int(y + radius + 2)),
+                    (int(lane_x - radius - 2), int(y)),
+                ]
+                inner_points = [
+                    (int(lane_x), int(y - max(8, radius - 6))),
+                    (int(lane_x + max(8, radius - 6)), int(y)),
+                    (int(lane_x), int(y + max(8, radius - 6))),
+                    (int(lane_x - max(8, radius - 6)), int(y)),
+                ]
+                pygame.draw.polygon(self.screen, fill, diamond_points)
+                pygame.draw.polygon(self.screen, (255, 255, 255), diamond_points, 3)
+                pygame.draw.polygon(self.screen, (*color, 120), inner_points, 2)
+            if double_notes_active:
+                clone_x = lane_x + max(10, int(radius * 0.85))
+                clone_y = min(strike_y - 8, y + max(10, int(radius * 0.35)))
+                ghost_color = (*color, 120)
+                ghost_surface = pygame.Surface((radius * 3, radius * 3), pygame.SRCALPHA)
+                pygame.draw.circle(ghost_surface, ghost_color, (ghost_surface.get_width() // 2, ghost_surface.get_height() // 2), radius)
+                pygame.draw.circle(ghost_surface, (240, 240, 240, 150), (ghost_surface.get_width() // 2, ghost_surface.get_height() // 2), radius, 3)
+                self.screen.blit(ghost_surface, (int(clone_x) - (ghost_surface.get_width() // 2), int(clone_y) - (ghost_surface.get_height() // 2)))
 
         if show_song_banner:
             banner_width = min(rect.width - 180, WINDOW_WIDTH - 360)

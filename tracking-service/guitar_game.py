@@ -1477,7 +1477,7 @@ class RhythmGame:
 
                 if self.state == "song_select" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
                     if self._can_control_song_select():
-                        self._start_song()
+                        self._begin_game_sequence()  # <-- CAMBIAR AQUI
                     continue
 
                 if self.state in ("finished", "failed") and event.key == pygame.K_RETURN:
@@ -1771,7 +1771,7 @@ class RhythmGame:
             return True
         if self._command_matches(command, "jugar", "empezar"):
             if self._can_control_song_select():
-                self._start_song()
+                self._begin_game_sequence()
             return True
         if self._command_matches(command, "facil"):
             if self._can_control_song_select():
@@ -1910,7 +1910,7 @@ class RhythmGame:
                 self._apply_song_selection(index)
                 self.selected_difficulty = "easy"
                 self._rebuild_notes_for_selected_difficulty()
-                self._start_song()
+                self._begin_game_sequence()
                 self._show_command_feedback("Tutorial iniciado")
                 return
         self.state = "song_select"
@@ -2142,17 +2142,32 @@ class RhythmGame:
                 self._set_difficulty(difficulty)
             self.state = "song_select"
             return
-        if packet_type == "start_game" and self.multiplayer_role == "client":
+        if packet_type == "load_song" and self.multiplayer_role == "client":
             song_index = payload.get("song_index", self.selected_song_index)
             difficulty = payload.get("difficulty", self.selected_difficulty)
             
             self._apply_song_selection(song_index)
             self._set_difficulty(difficulty)
             
-            # El cliente ejecuta el inicio inmediatamente.
-            # Como ambos aplican 2.0 segundos fijos en local, empezarán al mismo tiempo.
-            self._start_song(is_remote_start=True)
-            self.multiplayer_host_started = True
+            # Mostramos pantalla de "Cargando" interrumpiendo el flujo
+            self.state = "loading_song"
+            self._draw()
+            pygame.display.flip()
+            
+            self._load_song_assets()
+            self.multiplayer_session.send("client_ready")
+            self.state = "waiting_for_host_ready"
+            return
+            
+        if packet_type == "client_ready" and self.multiplayer_role == "host":
+            if self.state == "waiting_for_client_ready":
+                self.multiplayer_session.send("start_countdown")
+                self._start_song(delay_seconds=3.0)
+            return
+
+        if packet_type == "start_countdown" and self.multiplayer_role == "client":
+            if self.state == "waiting_for_host_ready":
+                self._start_song(delay_seconds=3.0)
             return
         if packet_type == "score_sync":
             self.multiplayer_remote_score = int(payload.get("score", 0))
@@ -2207,9 +2222,7 @@ class RhythmGame:
             
         self.state = "main_menu"
 
-    def _start_song(self, is_remote_start: bool = False):
-        # --- PRECARGAR AUDIO ANTES DE INICIAR EL TIEMPO ---
-        # Guardar estos textos estáticos como imágenes en la memoria
+    def _load_song_assets(self):
         self.cached_song_label = self.ui_font.render(f"{self.song_data.artist} - {self.song_data.title}", True, HUD_TEXT)
         self.cached_legend_label = self.small_font.render(
             "Platillo | Hi-Hat | Tarola | Tom superior | Tom inferior | Bombo", 
@@ -2217,52 +2230,50 @@ class RhythmGame:
         )
         if self.song_data.audio_path is not None:
             pygame.mixer.music.load(str(self.song_data.audio_path))
-            
             try:
                 if self.song_data.vocals_path is not None:
                     self.vocals_sound = pygame.mixer.Sound(str(self.song_data.vocals_path))
             except Exception:
                 self.vocals_sound = None
-
             try:
                 if self.song_data.rhythm_path is not None:
                     self.rhythm_sound = pygame.mixer.Sound(str(self.song_data.rhythm_path))
             except Exception:
                 self.rhythm_sound = None
-
             try:
                 if self.song_data.guitar_path is not None:
                     self.guitar_sound = pygame.mixer.Sound(str(self.song_data.guitar_path))
             except Exception:
                 self.guitar_sound = None
-
             self.drums_sounds = []
             for drum_path in self.song_data.drums_paths[:4]:
                 try:
                     self.drums_sounds.append(pygame.mixer.Sound(str(drum_path)))
                 except Exception:
                     continue
-        # --------------------------------------------------
-
-        # HOST: Envía la orden inmediata de que el juego acaba de cargar para los dos
-        if self.multiplayer_mode and self.multiplayer_role == "host" and not is_remote_start:
+    
+    def _begin_game_sequence(self):
+        """Inicia el proceso de carga de la cancion (sincronizando en red si aplica)."""
+        if self.multiplayer_mode and self.multiplayer_role == "host":
             self.multiplayer_session.send(
-                "start_game",
+                "load_song",
                 song_index=self.selected_song_index,
                 difficulty=self.selected_difficulty
             )
-            # El HOST AHORA ESPERA A QUE EL CLIENTE CARGUE.
-            # En vez de contar 2 segundos, el host asume que el cliente conectará en 3.5 segundos (1.5s de disco + 2.0s de highway).
-            delay_seconds = 4.0
-        elif self.multiplayer_mode and self.multiplayer_role == "client":
-            # El CLIENTE, como se puso a cargar los audios después del mensaje del host, empieza el highway rápidamente.
-            delay_seconds = 2.0
+            # Dibujar un frame antes de bloquear el sistema por carga de archivos
+            self.state = "loading_song"
+            self._draw()
+            pygame.display.flip()
+
+            self._load_song_assets()
+            self.state = "waiting_for_client_ready"
         else:
-            # Juego individual normal
-            delay_seconds = START_DELAY_SECONDS
-            
+            self._load_song_assets()
+            self._start_song(delay_seconds=3.0)
+
+    def _start_song(self, delay_seconds: float = 3.0):
         self.state = "playing"
-        
+        # Iniciamos un margen futuro de 3 segundos exactos.
         self.song_started_at = (pygame.time.get_ticks() / 1000.0) + delay_seconds
         self.music_started = False
         self.pause_started_at = None
@@ -2559,9 +2570,18 @@ class RhythmGame:
             self._draw_results()
         elif self.state == "credits":
             self._draw_credits()
+        elif self.state in ("loading_song", "waiting_for_client_ready", "waiting_for_host_ready"):
+            self._draw_loading_song()
 
         self._draw_command_bar()
         pygame.display.flip()
+
+    def _draw_loading_song(self):
+        self._draw_background()
+        text = self.title_font.render("Cargando la cancion...", True, HUD_TEXT)
+        self.screen.blit(text, text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)))
+        hint = self.small_font.render("Sincronizando sistemas del baterista y guitarrista", True, HUD_TEXT)
+        self.screen.blit(hint, hint.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 50)))
 
     def _draw_background(self):
         for y in range(WINDOW_HEIGHT):
@@ -2806,6 +2826,17 @@ class RhythmGame:
         highway_rect.center = (WINDOW_WIDTH // 2 + 8, int(WINDOW_HEIGHT * 0.43))
         self._draw_highway(highway_rect, self._current_song_time(), show_song_banner=True)
         self._draw_hud(highway_rect)
+
+        # -- LÓGICA DEL CONTADOR 3, 2, 1 --
+        time_to_start = -self._current_song_time()
+        if time_to_start > 0:
+            import math
+            countdown_val = math.ceil(time_to_start)
+            shadow = self.title_font.render(str(countdown_val), True, (0, 0, 0))
+            text = self.title_font.render(str(countdown_val), True, (255, 230, 80))
+            # Dibujar la sombra desplazada para ser muy visible
+            self.screen.blit(shadow, shadow.get_rect(center=(WINDOW_WIDTH//2 + 3, WINDOW_HEIGHT//2 + 3)))
+            self.screen.blit(text, text.get_rect(center=(WINDOW_WIDTH//2, WINDOW_HEIGHT//2)))
 
     def _draw_results(self):
         overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)

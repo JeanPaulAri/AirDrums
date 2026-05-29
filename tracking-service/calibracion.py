@@ -15,13 +15,13 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 
-LOWER_RED1 = np.array([0, 85, 150])
-UPPER_RED1 = np.array([10, 255, 255])
-LOWER_RED2 = np.array([170, 85, 150])
-UPPER_RED2 = np.array([179, 255, 255])
+LOWER_RED1 = np.array([12, 140, 200])
+UPPER_RED1 = np.array([30, 255, 255])
+LOWER_RED2 = np.array([12, 140, 200])  # Repetimos el mismo rango para no romper la lógica de máscara roja
+UPPER_RED2 = np.array([30, 255, 255])    # Repetimos el mismo rango para no romper la lógica de máscara roja
 
-LOWER_GREEN = np.array([75, 50, 120])
-UPPER_GREEN = np.array([100, 255, 255])
+LOWER_GREEN = np.array([95, 200, 150])
+UPPER_GREEN = np.array([110, 255, 255])
 
 
 def inicializar_audio():

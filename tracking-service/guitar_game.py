@@ -104,11 +104,11 @@ ZONE_LABELS = {
 
 # Teclas para pruebas manuales en PC.
 KEYBOARD_ZONE_MAP = {
-    pygame.K_a: "platillo",
-    pygame.K_s: "hithat",
-    pygame.K_d: "tarola",
-    pygame.K_j: "tom superior",
-    pygame.K_k: "tom inferior",
+    pygame.K_F1: "platillo",
+    pygame.K_F2: "hithat",
+    pygame.K_F3: "tarola",
+    pygame.K_F4: "tom superior",
+    pygame.K_F5: "tom inferior",
     pygame.K_SPACE: "bombo",
 }
 
@@ -1561,6 +1561,20 @@ class RhythmGame:
             if song_time >= self.song_length:
                 self.state = "finished"
                 pygame.mixer.music.stop()
+        
+        if self.state == "surrendered":
+            if current_time - self.surrender_started_at >= 4.0:
+                if self.surrender_action_type == "restart":
+                    self._restart_current_song()
+                else: 
+                    self._exit_to_song_select()
+            return
+
+        if self.state == "disconnected":
+            if current_time - self.disconnect_started_at >= 4.0:
+                self._leave_multiplayer_mode()
+                self._go_to_main_menu()
+            return
 
     def _supports_command_input(self):
         # Este cambio permite que los nuevos submenus de red también acepten comandos por voz/texto.
@@ -1576,6 +1590,7 @@ class RhythmGame:
             "confirm",
             "finished",
             "failed",
+            "surrendered",
         }
 
     def _normalize_command(self, command: str):
@@ -1807,7 +1822,7 @@ class RhythmGame:
             self._resume_game()
             return True
         if self._command_matches(command, "reiniciar"):
-            self._restart_current_song()
+            self._trigger_surrender("restart")
             return True
         if self._command_matches(command, "cambiar nivel", "nivel", "dificultad"):
             self.state = "pause_difficulty"
@@ -1823,17 +1838,17 @@ class RhythmGame:
     def _handle_pause_difficulty_command(self, command: str):
         if self._command_matches(command, "facil"):
             self._set_difficulty("easy")
-            self._restart_current_song()
+            self._trigger_surrender("restart", "easy")   # <-- PASAMOS EL NIVEL AQUÍ
             return True
-        if self._command_matches(command, "normal", "medio"):
+        if self._command_matches(command, "medio", "normal"):
             self._set_difficulty("medium")
-            self._restart_current_song()
+            self._trigger_surrender("restart", "medium") # <-- PASAMOS EL NIVEL AQUÍ
             return True
         if self._command_matches(command, "dificil"):
             self._set_difficulty("hard")
-            self._restart_current_song()
+            self._trigger_surrender("restart", "hard")   # <-- PASAMOS EL NIVEL AQUÍ
             return True
-        if self._command_matches(command, "atras", "volver"):
+        if self._command_matches(command, "volver"):
             self.state = "paused"
             return True
         return False
@@ -1921,7 +1936,7 @@ class RhythmGame:
         if option == "Continuar":
             self._resume_game()
         elif option == "Reiniciar":
-            self._restart_current_song()
+            self._trigger_surrender("restart") # Cambiar por esto
         elif option == "Cambiar nivel":
             self.state = "pause_difficulty"
         elif option == "Salir":
@@ -1931,13 +1946,13 @@ class RhythmGame:
         # Este cambio mantiene el cambio de nivel disponible aunque la canción venga sincronizada por host.
         if option == "Facil":
             self._set_difficulty("easy")
-            self._restart_current_song()
+            self._trigger_surrender("restart", "easy")   # <-- PASAMOS EL NIVEL AQUÍ
         elif option == "Normal":
             self._set_difficulty("medium")
-            self._restart_current_song()
+            self._trigger_surrender("restart", "medium") # <-- PASAMOS EL NIVEL AQUÍ
         elif option == "Dificil":
             self._set_difficulty("hard")
-            self._restart_current_song()
+            self._trigger_surrender("restart", "hard")   # <-- PASAMOS EL NIVEL AQUÍ
         elif option == "Atras":
             self.state = "paused"
 
@@ -2021,7 +2036,7 @@ class RhythmGame:
             self._start_tutorial_from_menu()
             return
         if self.confirm_context == "return_to_song_select":
-            self._exit_to_song_select()
+            self._trigger_surrender("exit") 
 
     def _go_to_main_menu(self):
         # Este cambio centraliza el regreso al menú principal desde individual y multijugador.
@@ -2099,16 +2114,13 @@ class RhythmGame:
         messages = self.multiplayer_session.poll_messages()
         if not self.multiplayer_session.connected and self.multiplayer_role == "host" and self.state == "multiplayer_host_lobby":
             return
-        if not self.multiplayer_session.connected and self.multiplayer_role == "host" and self.state in {"song_select", "playing", "paused", "finished", "failed"}:
-            self._show_command_feedback("El rival se desconecto")
-            self._leave_multiplayer_mode()
-            self.state = "song_select"
-            return
-        if not self.multiplayer_session.connected and self.multiplayer_role == "client":
-            self._show_command_feedback("Se perdio la conexion con el host")
-            self._leave_multiplayer_mode()
-            self._go_to_main_menu()
-            return
+        if not self.multiplayer_session.connected and self.state != "disconnected":
+            if self.multiplayer_role == "host" and self.state in {"song_select", "playing", "paused", "finished", "failed", "surrendered"}:
+                self._enter_disconnect_state("Se perdio la conexion con el cliente")
+                return
+            if self.multiplayer_role == "client":
+                self._enter_disconnect_state("Se perdio la conexion con el host")
+                return
         for payload in messages:
             self._handle_multiplayer_packet(payload)
         if self.multiplayer_role == "host" and self.multiplayer_session.connected and self.state == "multiplayer_host_lobby":
@@ -2173,10 +2185,18 @@ class RhythmGame:
             self.multiplayer_remote_score = int(payload.get("score", 0))
             self.multiplayer_remote_combo = int(payload.get("combo", 0))
             return
+        if packet_type == "surrender":
+            action_type = payload.get("action", "exit")
+            difficulty = payload.get("difficulty") # <-- Recibimos la nueva dificultad
+            
+            if difficulty:
+                self._set_difficulty(difficulty)   # <-- Seteamos su cuadro de notas
+                
+            self._enter_surrender_state(is_loser=False, action_type=action_type)
+            return
         if packet_type == "disconnect":
-            self._show_command_feedback("El rival salio de la partida")
-            self._leave_multiplayer_mode()
-            self._go_to_main_menu()
+            self._enter_disconnect_state("El rival salio de la partida")
+            return
 
     def _send_multiplayer_lobby_state(self):
         # Este cambio manda al cliente la canción y dificultad elegidas por el host en el selector.
@@ -2204,7 +2224,7 @@ class RhythmGame:
 
     def _accepts_keyboard_hits(self):
         # Este cambio deja el teclado como entrada principal del cliente remoto y opcional en individual.
-        return not self.multiplayer_mode or self.multiplayer_role == "client"
+        return True
 
     def _run_calibration_flow(self):
         # Este cambio mantiene la calibracion fuera del modo competitivo para no mezclar inputs de red.
@@ -2503,7 +2523,12 @@ class RhythmGame:
     def _trigger_fail_state(self):
         if self.state != "playing":
             return
-
+            
+        # Si esta en red y perdio su barra de vida/racha, cede el gane automáticamente
+        if self.multiplayer_mode and self.multiplayer_session.connected:
+            self._trigger_surrender("fail")
+            return
+            
         self.state = "failed"
         self.health = 0.0
         self.failure_started_at = pygame.time.get_ticks() / 1000.0
@@ -2565,6 +2590,9 @@ class RhythmGame:
         elif self.state == "failed":
             self._draw_playfield()
             self._draw_failed_overlay()
+        elif self.state == "surrendered":              # <---- AGREGAR AQUÍ
+            self._draw_playfield()
+            self._draw_surrendered_overlay()
         elif self.state == "finished":
             self._draw_playfield()
             self._draw_results()
@@ -2572,7 +2600,10 @@ class RhythmGame:
             self._draw_credits()
         elif self.state in ("loading_song", "waiting_for_client_ready", "waiting_for_host_ready"):
             self._draw_loading_song()
-
+        elif self.state == "disconnected":
+            if getattr(self, "song_started_at", None) is not None:
+                self._draw_playfield()
+            self._draw_disconnect_overlay()
         self._draw_command_bar()
         pygame.display.flip()
 
@@ -2893,6 +2924,55 @@ class RhythmGame:
         self.screen.blit(reason, reason.get_rect(center=(box.centerx, box.y + 112)))
         self.screen.blit(combo, combo.get_rect(center=(box.centerx, box.y + 156)))
         self.screen.blit(hint, hint.get_rect(center=(box.centerx, box.y + 196)))
+
+    def _draw_surrendered_overlay(self):
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((20, 0, 0, 148))
+        self.screen.blit(overlay, (0, 0))
+
+        box = pygame.Rect(0, 0, 680, 260)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)
+        pygame.draw.rect(self.screen, (28, 10, 10), box, border_radius=22)
+        
+        if self.surrender_is_loser:
+            color = (255, 90, 90)
+            status_text = "TE RENDISTE"
+            result_text = "PERDEDOR"
+        else:
+            color = (90, 255, 90)
+            status_text = "EL JUGADOR CONTRARIO SE RINDIO!"
+            result_text = "GANADOR"
+
+        pygame.draw.rect(self.screen, color, box, 3, border_radius=22)
+
+        status_surf = self.ui_font.render(status_text, True, color)
+        self.screen.blit(status_surf, status_surf.get_rect(center=(box.centerx, box.centery - 40)))
+
+        result_surf = self.title_font.render(result_text, True, HUD_TEXT)
+        self.screen.blit(result_surf, result_surf.get_rect(center=(box.centerx, box.centery + 10)))
+
+        action_msg = "Reiniciando cancion..." if self.surrender_action_type == "restart" else "Saliendo a seleccion de canciones..."
+        action_surf = self.small_font.render(action_msg, True, (200, 200, 200))
+        self.screen.blit(action_surf, action_surf.get_rect(center=(box.centerx, box.bottom - 40)))
+
+    def _draw_disconnect_overlay(self):
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((20, 0, 0, 148))
+        self.screen.blit(overlay, (0, 0))
+
+        box = pygame.Rect(0, 0, 680, 260)
+        box.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)
+        pygame.draw.rect(self.screen, (28, 10, 10), box, border_radius=22)
+        pygame.draw.rect(self.screen, (255, 90, 90), box, 3, border_radius=22)
+
+        status_surf = self.title_font.render("ERROR DE RED", True, (255, 90, 90))
+        self.screen.blit(status_surf, status_surf.get_rect(center=(box.centerx, box.centery - 40)))
+
+        msg_surf = self.ui_font.render(self.disconnect_message, True, HUD_TEXT)
+        self.screen.blit(msg_surf, msg_surf.get_rect(center=(box.centerx, box.centery + 10)))
+
+        action_surf = self.small_font.render("Regresando al menu principal...", True, (200, 200, 200))
+        self.screen.blit(action_surf, action_surf.get_rect(center=(box.centerx, box.bottom - 40)))
 
     def _draw_pause_overlay(self):
         overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
@@ -3332,6 +3412,48 @@ class RhythmGame:
     def _was_recent_zone_hit(self, zone):
         current_time = pygame.time.get_ticks() / 1000.0
         return self.last_hit_zone == zone and (current_time - self.last_hit_at) < 0.18
+    
+    def _trigger_surrender(self, action_type: str, difficulty: str = None):
+        if self.multiplayer_mode and self.multiplayer_session.connected:
+            packet_data = {"action": action_type}
+            if difficulty:
+                packet_data["difficulty"] = difficulty
+            self.multiplayer_session.send("surrender", **packet_data)
+        
+        self._enter_surrender_state(is_loser=True, action_type=action_type)
+
+    def _enter_surrender_state(self, is_loser: bool, action_type: str):
+        self.state = "surrendered"
+        self.surrender_is_loser = is_loser
+        self.surrender_action_type = action_type
+        self.surrender_started_at = pygame.time.get_ticks() / 1000.0
+        
+        # Detener la música mientras sale la pantalla
+        pygame.mixer.music.stop()
+        try:
+            self.vocals_channel.stop()
+            self.rhythm_channel.stop()
+            self.guitar_channel.stop()
+            for channel in self.drums_channels:
+                channel.stop()
+        except Exception:
+            pass
+    
+    def _enter_disconnect_state(self, message: str):
+        self.state = "disconnected"
+        self.disconnect_message = message
+        self.disconnect_started_at = pygame.time.get_ticks() / 1000.0
+        
+        # Cortar la música por completo al perder conexión
+        pygame.mixer.music.stop()
+        try:
+            self.vocals_channel.stop()
+            self.rhythm_channel.stop()
+            self.guitar_channel.stop()
+            for channel in self.drums_channels:
+                channel.stop()
+        except Exception:
+            pass
 
 
 def main():

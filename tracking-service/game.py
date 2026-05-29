@@ -35,14 +35,18 @@ pygame.mixer.init()
 pygame.mixer.set_num_channels(32)
 # ... [Copia aquí los rangos de colores HSV] ...
 # Rojo / rosado limpio
-lower_red1 = np.array([0, 85, 150])
-upper_red1 = np.array([10, 255, 255])
+# Color 1 (Amarillo/Naranja) - Reemplaza al antiguo "Rojo"
+lower_red1 = np.array([12, 140, 200])
+upper_red1 = np.array([30, 255, 255])
 
-lower_red2 = np.array([170, 85, 150])
-upper_red2 = np.array([179, 255, 255])
+# El naranja no necesita dos rangos (a diferencia del rojo puro), 
+# pero repetimos los valores para no romper tu variable mask_red = red1 + red2
+lower_red2 = lower_red1 
+upper_red2 = upper_red1
 
-lower_green = np.array([75, 50, 120])
-upper_green = np.array([100, 255, 255])
+# Color 2 (Azul/Celeste) - Reemplaza al antiguo "Verde"
+lower_green = np.array([95, 200, 150])
+upper_green = np.array([110, 255, 255])
 
 # --- Configuración de Sonidos ---
 archivos_sonido = {

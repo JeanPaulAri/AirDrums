@@ -32,7 +32,7 @@ UDP_BUFFER_SIZE = 2048
 
 # Entrada de comandos de voz desde voice_listener.py por UDP.
 VOICE_UDP_HOST = "127.0.0.1"
-VOICE_UDP_PORT = 5054
+VOICE_UDP_PORT = 5061
 MULTIPLAYER_TCP_PORT = 5060
 
 # Título y carpeta base de canciones.
@@ -1283,7 +1283,7 @@ class RhythmGame:
         self.confirm_index = 1
         self.confirm_context = "return_to_pause"
         self.voice_listener = ExternalVoiceProcess(VOICE_LISTENER_PY_PATH, VOICE_LISTENER_PS1_PATH)
-        self.voice_listener.start()
+        #self.voice_listener.start()
         self.voice_backend_name = self._detect_voice_backend_name()
         self.note_speed_options = {"lento": 0.8, "normal": 1.0, "rapido": 1.25}
         self.note_speed_label = "normal"

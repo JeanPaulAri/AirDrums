@@ -96,7 +96,7 @@ POWER_DEFINITIONS = {
         "sequence": ("hithat", "tom superior", "platillo"),
     },
     "hide_notes": {
-        "label": "Ocultar",
+        "label": "Parpadeo",
         "color": (186, 124, 255),
         "sequence": ("tarola", "bombo", "hithat"),
     },
@@ -3344,23 +3344,54 @@ class RhythmGame:
 
     def _draw_power_slots(self, shell_rect: pygame.Rect, side: str, powers: list[str], active_effects: list[str]):
         # Este cambio pinta los poderes ganados y los efectos activos junto a cada barra de vida.
-        power_x = shell_rect.right + 14 if side == "left" else shell_rect.x - 122
+        power_x = shell_rect.right + 42 if side == "left" else shell_rect.x - 42
         active_set = set(active_effects)
-        if not powers:
-            empty_rect = pygame.Rect(power_x, shell_rect.y + 18, 108, 40)
-            self._draw_panel(empty_rect, fill_alpha=70, radius=12)
-            empty_surface = self.tiny_font.render("Sin poderes", True, (170, 170, 170))
-            self.screen.blit(empty_surface, empty_surface.get_rect(center=empty_rect.center))
-            return
-        for index, power_name in enumerate(powers[:3]):
-            slot_rect = pygame.Rect(power_x, shell_rect.y + 18 + (index * 56), 108, 40)
-            self._draw_panel(slot_rect, fill_alpha=92, radius=12)
-            power_info = POWER_DEFINITIONS.get(power_name, {"label": power_name, "color": HUD_TEXT})
-            color = power_info["color"]
-            if power_name in active_set:
-                pygame.draw.rect(self.screen, (*color, 255), slot_rect, 2, border_radius=12)
-            label_surface = self.tiny_font.render(power_info["label"][:13], True, color)
-            self.screen.blit(label_surface, label_surface.get_rect(center=slot_rect.center))
+        start_y = shell_rect.y + 26
+        for index in range(3):
+            center = (power_x, start_y + (index * 58))
+            if index < len(powers):
+                power_name = powers[index]
+                self._draw_power_icon(center, 21, power_name, power_name in active_set)
+            else:
+                self._draw_empty_power_icon(center, 21)
+
+    def _draw_empty_power_icon(self, center: tuple[int, int], radius: int):
+        # Este cambio deja ranuras redondas discretas cuando el jugador aun no tiene poderes.
+        pygame.draw.circle(self.screen, (22, 14, 20), center, radius + 6)
+        pygame.draw.circle(self.screen, (88, 78, 74), center, radius + 4, 2)
+        pygame.draw.circle(self.screen, (58, 52, 50), center, radius - 2, 1)
+        pygame.draw.line(self.screen, (88, 78, 74), (center[0] - 8, center[1] + 8), (center[0] + 8, center[1] - 8), 2)
+
+    def _draw_power_icon(self, center: tuple[int, int], radius: int, power_name: str, is_active: bool):
+        # Este cambio dibuja iconos redondos estilo arcade para que cada poder se lea sin depender de texto.
+        power_info = POWER_DEFINITIONS.get(power_name, {"color": HUD_TEXT})
+        color = power_info["color"]
+        outer_color = tuple(min(255, channel + 45) for channel in color)
+        if is_active:
+            glow_surface = pygame.Surface((radius * 4, radius * 4), pygame.SRCALPHA)
+            pygame.draw.circle(glow_surface, (*color, 55), (glow_surface.get_width() // 2, glow_surface.get_height() // 2), radius + 12)
+            self.screen.blit(glow_surface, (center[0] - (glow_surface.get_width() // 2), center[1] - (glow_surface.get_height() // 2)))
+        pygame.draw.circle(self.screen, (18, 12, 18), center, radius + 6)
+        pygame.draw.circle(self.screen, outer_color if is_active else color, center, radius + 4, 3)
+        pygame.draw.circle(self.screen, color, center, radius)
+        pygame.draw.circle(self.screen, (248, 240, 218), center, radius, 2)
+
+        if power_name == "double_notes":
+            pygame.draw.circle(self.screen, (248, 240, 218), (center[0] - 6, center[1] + 2), 7, 2)
+            pygame.draw.circle(self.screen, (248, 240, 218), (center[0] + 7, center[1] - 4), 7, 2)
+            pygame.draw.line(self.screen, (248, 240, 218), (center[0] - 10, center[1] + 10), (center[0] + 10, center[1] - 10), 2)
+        elif power_name == "invert_colors":
+            pygame.draw.polygon(self.screen, (248, 240, 218), [(center[0] - 10, center[1] + 7), (center[0] + 2, center[1] - 10), (center[0] + 10, center[1] + 7)], 2)
+            pygame.draw.arc(self.screen, (248, 240, 218), (center[0] - 13, center[1] - 13, 20, 20), 0.4, 3.6, 2)
+            pygame.draw.arc(self.screen, (248, 240, 218), (center[0] - 7, center[1] - 7, 20, 20), 3.55, 6.1, 2)
+        elif power_name == "hide_notes":
+            pygame.draw.circle(self.screen, (248, 240, 218), center, 6, 2)
+            pygame.draw.circle(self.screen, (248, 240, 218), (center[0] - 11, center[1] - 7), 2)
+            pygame.draw.circle(self.screen, (248, 240, 218), (center[0] + 11, center[1] - 2), 2)
+            pygame.draw.circle(self.screen, (248, 240, 218), (center[0] - 2, center[1] + 11), 2)
+            pygame.draw.arc(self.screen, (248, 240, 218), (center[0] - 15, center[1] - 15, 30, 30), 0.2, 1.1, 2)
+            pygame.draw.arc(self.screen, (248, 240, 218), (center[0] - 15, center[1] - 15, 30, 30), 2.0, 2.9, 2)
+            pygame.draw.arc(self.screen, (248, 240, 218), (center[0] - 15, center[1] - 15, 30, 30), 4.0, 4.9, 2)
 
     def _draw_highway(self, rect: pygame.Rect, preview_time: float, show_song_banner: bool):
         # Este cambio aplica efectos visuales de poderes sobre la pista sin tocar destructivamente el chart base.
@@ -3504,9 +3535,10 @@ class RhythmGame:
             progress = 1.0 - (time_until_hit / preview_lead)
             progress = max(0.0, min(1.0, progress))
             travel_progress = progress ** NOTE_TRAVEL_CURVE
+            hide_this_note = hide_notes_active and self._should_hide_note_with_blink(note, preview_time)
 
             if note.zone == "bombo":
-                if hide_notes_active:
+                if hide_this_note:
                     continue
                 y = top_y + ((kick_y - top_y) * travel_progress)
                 kick_note_left = self._point_on_width(left_top, left_bottom, right_top, right_bottom, y, 0.0)
@@ -3537,7 +3569,7 @@ class RhythmGame:
                     pygame.draw.line(self.screen, (*KICK_COLOR_PRESSED[:3],), clone_left, clone_right, max(4, int(3 + (progress * 7))))
                 continue
 
-            if hide_notes_active:
+            if hide_this_note:
                 continue
             lane_index = ZONE_TO_LANE[note.zone]
             y = top_y + ((strike_y - top_y) * travel_progress)
@@ -3600,6 +3632,13 @@ class RhythmGame:
             self._draw_panel(top_label_panel, fill_alpha=102, radius=16)
             self.screen.blit(self.cached_song_label, (top_label_panel.x + 16, top_label_panel.y + 6))
             self.screen.blit(self.cached_legend_label, (top_label_panel.x + 16, top_label_panel.y + 30))
+
+    def _should_hide_note_with_blink(self, note: Note, preview_time: float):
+        # Este cambio hace que el poder morado parpadee notas de forma aleatoria en vez de borrarlas por completo.
+        lane_seed = ZONE_TO_LANE.get(note.zone, 5)
+        phase = (preview_time * 18.0) + (note.time * 11.0) + (lane_seed * 1.73)
+        blink_wave = math.sin(phase) + (math.sin((phase * 0.57) + 1.4) * 0.55)
+        return blink_wave < -0.1
 
     def _current_song_time(self):
         if self.song_started_at is None:

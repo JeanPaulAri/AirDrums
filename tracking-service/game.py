@@ -17,7 +17,7 @@ def obtener_centro_global(mask):
     if contornos:
         # Quedarnos con la mancha de color más grande
         c_max = max(contornos, key=cv2.contourArea)
-        if cv2.contourArea(c_max) > 500: # Ignorar manchas muy pequeñas
+        if cv2.contourArea(c_max) > 200: # Ignorar manchas muy pequeñas
             M = cv2.moments(c_max)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
@@ -36,17 +36,17 @@ pygame.mixer.set_num_channels(32)
 # ... [Copia aquí los rangos de colores HSV] ...
 # Rojo / rosado limpio
 # Color 1 (Amarillo/Naranja) - Reemplaza al antiguo "Rojo"
-lower_red1 = np.array([12, 140, 200])
-upper_red1 = np.array([30, 255, 255])
+lower_red1 = np.array([105, 180, 80])
+upper_red1 = np.array([125, 255, 255])
 
 # El naranja no necesita dos rangos (a diferencia del rojo puro), 
 # pero repetimos los valores para no romper tu variable mask_red = red1 + red2
 lower_red2 = lower_red1 
 upper_red2 = upper_red1
 
-# Color 2 (Azul/Celeste) - Reemplaza al antiguo "Verde"
-lower_green = np.array([95, 200, 150])
-upper_green = np.array([110, 255, 255])
+# Color 2  - Reemplaza al antiguo "Verde"
+lower_green = np.array([70, 200, 40])
+upper_green = np.array([85, 255, 180])
 
 # --- Configuración de Sonidos ---
 archivos_sonido = {

@@ -234,6 +234,7 @@ class DifficultyProfile:
     """Parámetros de simplificación y supervivencia por dificultad."""
     key: str
     label: str
+    speed_multiplier: float
     note_gap_seconds: float
     kick_gap_seconds: float
     chord_window_seconds: float
@@ -255,14 +256,12 @@ DIFFICULTY_PROFILES = {
     "easy": DifficultyProfile(
         key="easy",
         label="Facil",
-        note_gap_seconds=DRUM_FRIENDLY_NOTE_GAP_SECONDS,
-        
-        # 1. Aumenta el tiempo mínimo entre bombos (ej: de 0.50 a 1.5 o incluso 2.0 segundos)
-        kick_gap_seconds=1.5,
-        
+        speed_multiplier=0.75,
+        note_gap_seconds=0.80, # Antes: DRUM_FRIENDLY_NOTE_GAP_SECONDS (0.26)
+        kick_gap_seconds=2.50, # Antes: 1.5
         chord_window_seconds=DRUM_CHORD_WINDOW_SECONDS,
-        global_min_gap_seconds=DRUM_GLOBAL_MIN_GAP_SECONDS,
-        max_notes_per_second=DRUM_MAX_NOTES_PER_SECOND,
+        global_min_gap_seconds=0.60, # Antes: DRUM_GLOBAL_MIN_GAP_SECONDS (0.22)
+        max_notes_per_second=2, # Antes: DRUM_MAX_NOTES_PER_SECOND (4)
         health_gain_hit=0.028,
         health_loss_miss=0.001,
         health_loss_bad_hit=0.001,
@@ -270,21 +269,18 @@ DIFFICULTY_PROFILES = {
         gap_fill_threshold_seconds=99.0,
         gap_fill_max_notes=0,
         fill_zones=(),
-        
-        # 2. Reduce para que solo permita 1 bombo máximo en la ventana de tiempo
         max_kicks_in_window=1, 
-        
-        # 3. Aumenta el tamaño de la ventana a 2.5 segundos
-        kick_density_window_seconds=2.5, 
+        kick_density_window_seconds=3.0, 
     ),
     "medium": DifficultyProfile(
         key="medium",
         label="Medio",
-        note_gap_seconds=0.19,
-        kick_gap_seconds=0.36,
+        speed_multiplier=1.0,
+        note_gap_seconds=0.45, # Antes 0.19
+        kick_gap_seconds=1.50, # Antes 0.36
         chord_window_seconds=0.10,
-        global_min_gap_seconds=0.14,
-        max_notes_per_second=6,
+        global_min_gap_seconds=0.35, # Antes 0.14
+        max_notes_per_second=3, # Antes 6
         health_gain_hit=0.022,
         health_loss_miss=0.03,
         health_loss_bad_hit=0.022,
@@ -293,19 +289,20 @@ DIFFICULTY_PROFILES = {
         gap_fill_max_notes=1,
         fill_zones=("hithat", "tom superior", "hithat", "tom inferior"),
         max_kicks_in_window=2,
-        kick_density_window_seconds=1.1,
+        kick_density_window_seconds=1.5,
     ),
     "hard": DifficultyProfile(
         key="hard",
         label="Dificil",
-        note_gap_seconds=0.11,
-        kick_gap_seconds=0.24,
+        speed_multiplier=1.5,
+        note_gap_seconds=0.25, # Antes 0.11
+        kick_gap_seconds=0.65, # Antes 0.24
         chord_window_seconds=0.05,
-        global_min_gap_seconds=0.07,
-        max_notes_per_second=9,
+        global_min_gap_seconds=0.15, # Antes 0.07
+        max_notes_per_second=5, # Antes 9
         health_gain_hit=0.020,
-        health_loss_miss=0.055,
-        health_loss_bad_hit=0.026,
+        health_loss_miss=0.01,
+        health_loss_bad_hit=0.01,
         fail_streak=100,
         gap_fill_threshold_seconds=0.42,
         gap_fill_max_notes=2,
@@ -540,6 +537,11 @@ class UdpHitReceiver:
         self.socket = None
         self.available = False
         self.bind_error = ""
+        # AGREGAR: Guardar la posición X e Y de las baquetas
+        self.stick_1_y = None
+        self.stick_2_y = None
+        self.stick_1_x = None
+        self.stick_2_x = None
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.bind((host, port))
@@ -569,7 +571,16 @@ class UdpHitReceiver:
                 message = json.loads(data.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
+                
+            # NUEVO: Si recibimos coordenadas, registrar su estado global
+            if message.get("tipo") == "posicion":
+                self.stick_1_y = message.get("stick_1_y")
+                self.stick_2_y = message.get("stick_2_y")
+                self.stick_1_x = message.get("stick_1_x")
+                self.stick_2_x = message.get("stick_2_x")
+                continue
 
+            # Mantener la captura de golpes a la lista
             zone = message.get("zone")
             if zone:
                 hits.append(zone)
@@ -1579,11 +1590,47 @@ class RhythmGame:
             self._submit_command(voice_command)
             self._show_command_feedback(f"Voz: {voice_command}")
 
+        hits = self.receiver.poll_hits()
+        hit_set = set(hits)
+
         if self.state == "playing":
             if self.song_started_at is not None and current_time >= self.song_started_at and not self.music_started:
                 self._start_music()
 
-            for zone in self.receiver.poll_hits():
+            # PAUSA AUTOMÁTICA: Si ambas baquetas salen de pantalla (o no detectadas)
+            if self.receiver.stick_1_y is None and self.receiver.stick_2_y is None:
+                self._pause_game()
+
+            # NUEVO -> HABILIDAD (POWER) AL CRUZAR LAS BAQUETAS:
+            s1x = self.receiver.stick_1_x
+            s2x = self.receiver.stick_2_x
+            
+            if s1x is not None and s2x is not None:
+                # current_sign indica qué baqueta está a la derecha de la otra
+                current_sign = (s1x > s2x)
+                
+                # Asignamos la primera posición que adopta el usuario como su postura "normal"
+                if not hasattr(self, "sticks_normal_sign"):
+                    self.sticks_normal_sign = current_sign
+                    self.sticks_crossed_sign = current_sign
+                
+                # Verificamos si cambió respecto a la postura del instante anterior
+                if current_sign != self.sticks_crossed_sign:
+                    self.sticks_crossed_sign = current_sign
+                    
+                    # Activamos el poder SOLO si el cambio fue para alejarse de la postura normal (cruce)
+                    if current_sign != self.sticks_normal_sign:
+                        self._use_next_power()
+            else:
+                # Limpiamos el calibrado dinámico temporal de las baquetas si salen de cámara 
+                # (por si el usuario cambia los colores de mano)
+                if hasattr(self, "sticks_normal_sign"):
+                    del self.sticks_normal_sign
+                if hasattr(self, "sticks_crossed_sign"):
+                    del self.sticks_crossed_sign
+
+            # Procesar el mapa normal de golpes con la canción
+            for zone in hits:
                 self._register_hit(zone)
 
             song_time = self._current_song_time()
@@ -1593,6 +1640,29 @@ class RhythmGame:
             if song_time >= self.song_length:
                 self.state = "finished"
                 pygame.mixer.music.stop()
+        # NAVEGACIÓN EN LOS MENÚS / PAUSA
+        elif self.state not in ("surrendered", "disconnected", "finished", "failed"):
+            fake_key = None
+            
+            # Verde (Platillo) + Azul (Tom Superior) = Enter
+            if "platillo" in hit_set and "tom superior" in hit_set:
+                fake_key = pygame.K_RETURN
+            # Verde (Platillo) + Naranja (Tom Inferior) = Escape / Atrás
+            elif "platillo" in hit_set and "tom inferior" in hit_set:
+                fake_key = pygame.K_ESCAPE
+            # Rojo (Hithat) = Arriba
+            elif "hithat" in hit_set:
+                fake_key = pygame.K_UP
+            # Amarillo (Tarola) = Abajo
+            elif "tarola" in hit_set:
+                fake_key = pygame.K_DOWN
+            # Azul (Tom superior) solo = Derecha
+            elif "tom superior" in hit_set:
+                fake_key = pygame.K_RIGHT
+                
+            if fake_key:
+                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=fake_key))
+                 
         if self.state == "surrendered":
             if current_time - self.surrender_started_at >= 4.0:
                 if self.surrender_action_type == "restart":
@@ -1606,6 +1676,8 @@ class RhythmGame:
                 self._leave_multiplayer_mode()
                 self._go_to_main_menu()
             return
+
+
 
     def _supports_command_input(self):
         # Este cambio permite que los nuevos submenus de red también acepten comandos por voz/texto.
@@ -2456,8 +2528,14 @@ class RhythmGame:
         return bool(self.song_data and self.song_data.metadata and self.song_data.metadata.get("speed_control") == "true")
 
     def _current_preview_lead(self):
-        speed_multiplier = self.note_speed_options.get(self.note_speed_label, 1.0)
-        return PREVIEW_LEAD_SECONDS / speed_multiplier
+        option_speed_multiplier = self.note_speed_options.get(self.note_speed_label, 1.0)
+        try:
+            difficulty_speed_multiplier = self._current_profile().speed_multiplier
+        except AttributeError:
+            difficulty_speed_multiplier = 1.0
+        
+        total_multiplier = option_speed_multiplier * difficulty_speed_multiplier
+        return max(0.1, PREVIEW_LEAD_SECONDS / total_multiplier)
 
     def _set_note_speed(self, speed_label: str):
         if speed_label not in self.note_speed_options:
@@ -2763,8 +2841,34 @@ class RhythmGame:
                 self._draw_playfield()
             self._draw_disconnect_overlay()
 
+        # NUEVO: DIBUJAR LEYENDA CUANDO NO ESTEMOS EN JUEGO
+        if self.state not in ("playing", "finished", "failed", "surrendered"):
+            self._draw_menu_legend()
+
         self._draw_command_bar()
         pygame.display.flip()
+
+    def _draw_menu_legend(self):
+        legend_rect = pygame.Rect(WINDOW_WIDTH - 270, WINDOW_HEIGHT - 180, 250, 160)
+        self._draw_panel(legend_rect, border_color=(200, 200, 200), fill_alpha=160, radius=12)
+        
+        font = pygame.font.SysFont(None, 24)
+        title = font.render("Controles de Menú:", True, HUD_TEXT)
+        self.screen.blit(title, (legend_rect.x + 15, legend_rect.y + 15))
+        
+        lines = [
+            ("Rojo", "Arriba"),
+            ("Amarillo", "Abajo"),
+            ("Azul", "Derecha"),
+            ("Verde + Azul", "Enter/Aceptar"),
+            ("Verde + Naranja", "Atrás/Esc")
+        ]
+        
+        y = legend_rect.y + 45
+        for col1, col2 in lines:
+            txt = font.render(f"{col1}: {col2}", True, HUD_TEXT)
+            self.screen.blit(txt, (legend_rect.x + 15, y))
+            y += 22
 
     def _draw_loading_song(self):
         self._draw_background()

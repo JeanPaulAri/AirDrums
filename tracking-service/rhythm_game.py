@@ -1761,10 +1761,10 @@ class RhythmGame:
             fake_key = None
             
             # Verde (Platillo) + Azul (Tom Superior) = Enter
-            if "platillo" in hit_set and "tom superior" in hit_set:
+            if "platillo" in hit_set and "tom inferior" in hit_set:
                 fake_key = pygame.K_RETURN
             # Verde (Platillo) + Naranja (Tom Inferior) = Escape / Atrás
-            elif "platillo" in hit_set and "tom inferior" in hit_set:
+            elif "platillo" in hit_set and "tom superior" in hit_set:
                 fake_key = pygame.K_ESCAPE
             # Rojo (Hithat) = Arriba
             elif "hithat" in hit_set:

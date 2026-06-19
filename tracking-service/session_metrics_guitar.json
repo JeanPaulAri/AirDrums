@@ -1,0 +1,25 @@
+{
+  "session_id": "2026-06-19T00:59:03",
+  "updated_at": "2026-06-19T01:21:29",
+  "instrument": "guitar_keyboard",
+  "session_elapsed_seconds": 1345.981,
+  "state": "finished",
+  "song": {
+    "title": "Monsoon",
+    "artist": "Tokio Hotel",
+    "difficulty": "hard"
+  },
+  "metrics": {
+    "hits_outside_game": 0,
+    "songs_started": 5,
+    "correct_notes": 2720,
+    "missed_notes": 318,
+    "false_hits": 249,
+    "correct_hit_latency_samples": 2720,
+    "correct_hit_latency_ms_total": 123429.063,
+    "correct_hit_latency_ms_average": 45.378,
+    "false_hit_latency_samples": 213,
+    "false_hit_latency_ms_total": 337481.809,
+    "false_hit_latency_ms_average": 1584.422
+  }
+}

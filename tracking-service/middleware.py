@@ -200,7 +200,7 @@ class AirDrumsMiddleware:
                 (GAME_UI_HOST, GAME_UI_PORT),
             ):
                 self.unity_socket.sendto(encoded, (host, port))
-            print(f"[SEND] {payload}")
+            #print(f"[SEND] {payload}")
         except OSError as error:
             print(f"[WARN] No se pudo enviar a un cliente: {error}")
 

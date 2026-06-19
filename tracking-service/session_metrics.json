@@ -1,0 +1,25 @@
+{
+  "session_id": "2026-06-19T00:51:09",
+  "updated_at": "2026-06-19T00:55:09",
+  "session_elapsed_seconds": 228.525,
+  "camera_ready_delay_seconds": 11.264,
+  "state": "main_menu",
+  "song": {
+    "title": "The Kill",
+    "artist": "30 Seconds to Mars",
+    "difficulty": "easy"
+  },
+  "metrics": {
+    "hits_outside_game": 0,
+    "songs_started": 0,
+    "correct_notes": 0,
+    "missed_notes": 0,
+    "false_hits": 0,
+    "correct_hit_latency_samples": 0,
+    "correct_hit_latency_ms_total": 0.0,
+    "correct_hit_latency_ms_average": 0.0,
+    "false_hit_latency_samples": 0,
+    "false_hit_latency_ms_total": 0.0,
+    "false_hit_latency_ms_average": 0.0
+  }
+}

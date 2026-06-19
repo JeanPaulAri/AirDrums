@@ -57,8 +57,9 @@ HIGHWAY_FILL = (32, 25, 24)
 HUD_TEXT = (241, 232, 208)
 MISS_TEXT = (255, 117, 117)
 # Ventanas de timing y arranque.
-EARLY_HIT_WINDOW_SECONDS = 0.120
-LATE_HIT_WINDOW_SECONDS = 0.120
+EARLY_HIT_WINDOW_SECONDS = 0.2
+LATE_HIT_WINDOW_SECONDS = 0.2
+PERFECT_HIT_WINDOW_SECONDS = 0.120
 PREVIEW_LEAD_SECONDS = 3.35
 START_DELAY_SECONDS = 1.5
 # Filtros para reducir densidad en charts de batería.
@@ -1322,7 +1323,8 @@ class RhythmGame:
         self.multiplayer_local_ip = self.multiplayer_session.get_local_ip()
         self.multiplayer_host_started = False
         self._apply_song_selection(self.selected_song_index)
-
+        self.lane_feedbacks = {}
+        
         self.score = 0
         self.combo = 0
         self.best_combo = 0
@@ -2668,6 +2670,7 @@ class RhythmGame:
                 candidate = note
                 candidate_offset = offset
 
+        # --- AQUÍ EMPIEZAN LOS CAMBIOS DE COLOR ---
         if candidate is None:
             self.combo = 0
             has_upcoming_note = self._has_upcoming_note(zone, song_time)
@@ -2678,6 +2681,9 @@ class RhythmGame:
             self._change_health(-penalty)
             self.last_hit_zone = zone
             self.last_hit_at = current_time
+            
+            # Guardamos feedback MORADO para impactos incorrectos (Bad)
+            self.lane_feedbacks[zone] = {"time": current_time, "color": (147, 112, 219)}
             self._check_fail_state()
             return
 
@@ -2689,8 +2695,17 @@ class RhythmGame:
         self.miss_streak = 0
         self._change_health(self._current_profile().health_gain_hit)
         self.score += max(50, int(150 - (abs(candidate_offset) * 500)))
-        # Ampliamos la ventana de Perfecto de 55ms a 65ms
-        self.last_judgement = "Perfecto" if abs(candidate_offset) < 0.075 else "Bien"        
+        
+        # Evaluación con el umbral extraído
+        if abs(candidate_offset) < PERFECT_HIT_WINDOW_SECONDS:
+            self.last_judgement = "Perfecto"
+            fb_color = (0, 191, 255)  # Celeste
+        else:
+            self.last_judgement = "Bien"
+            fb_color = (50, 205, 50)  # Verde claro
+            
+        self.lane_feedbacks[zone] = {"time": current_time, "color": fb_color}
+        
         self.last_hit_zone = zone
         self.last_hit_at = current_time
         self._track_power_sequence(candidate)
@@ -2703,6 +2718,7 @@ class RhythmGame:
         return False
 
     def _judge_missed_notes(self, song_time: float):
+        current_time = pygame.time.get_ticks() / 1000.0  # <--- Añadir esta línea
         for note in self.notes:
             if note.judged:
                 continue
@@ -2716,6 +2732,10 @@ class RhythmGame:
                 self.miss_streak += 1
                 self._change_health(-self._current_profile().health_loss_miss)
                 self.last_judgement = "Miss"
+                
+                # Guardamos feedback ROJO para la nota perdida
+                self.lane_feedbacks[note.zone] = {"time": current_time, "color": (220, 20, 60)}
+                
                 self._check_fail_state()
                 if self.state == "failed":
                     break
@@ -3774,6 +3794,58 @@ class RhythmGame:
                 pygame.draw.circle(ghost_surface, ghost_color, (ghost_surface.get_width() // 2, ghost_surface.get_height() // 2), radius)
                 pygame.draw.circle(ghost_surface, (240, 240, 240, 150), (ghost_surface.get_width() // 2, ghost_surface.get_height() // 2), radius, 3)
                 self.screen.blit(ghost_surface, (int(clone_x) - (ghost_surface.get_width() // 2), int(clone_y) - (ghost_surface.get_height() // 2)))
+
+        # =========================================================================
+        # REFACTORIZADO: CÍRCULOS DE FEEDBACK GIGANTES, ULTRA-SATURADOS Y DE ALTO CONTRASTE
+        # =========================================================================
+        current_real_time = pygame.time.get_ticks() / 1000.0
+        for zone, fb in list(self.lane_feedbacks.items()):
+            elapsed = current_real_time - fb["time"]
+            
+            if elapsed < EARLY_HIT_WINDOW_SECONDS:
+                pct = elapsed / EARLY_HIT_WINDOW_SECONDS
+                
+                # --- [1] CONFIGURACIÓN DE TAMAÑO GIGANTE ---
+                base_radius = 55       # Casi el doble del tamaño original (era 28)
+                expansion_range = 45   # Rango de expansión (el círculo llegará hasta un radio de 100px)
+                anim_radius = base_radius + int(expansion_range * pct)
+                
+                # --- [2] CONFIGURACIÓN DE OPACIDAD / SATURACIÓN ---
+                # Exponente (pct ** 1.5) para que el círculo mantenga su brillo máximo más tiempo antes de desaparecer
+                alpha = int(255 * (1.0 - (pct ** 1.5)))
+                
+                # Posicionamiento en pantalla
+                if zone == "bombo":
+                    x_pos = rect.centerx
+                    y_pos = kick_y
+                else:
+                    l_idx = ZONE_TO_LANE[zone]
+                    x_pos = self._lane_center_x(left_top, left_bottom, right_top, right_bottom, strike_y, l_idx)
+                    y_pos = strike_y
+                
+                # Creamos una superficie de dibujado grande para evitar que se corte el círculo
+                fb_surface = pygame.Surface((anim_radius * 2 + 40, anim_radius * 2 + 40), pygame.SRCALPHA)
+                center_surf = anim_radius + 20
+                
+                # --- [3] CAPAS DE DIBUJADO PARA MÁXIMA VISIBILIDAD DESDE LEJOS ---
+                
+                # Capa A: Resplandor exterior de fondo (Glow difuminado pero gigante)
+                pygame.draw.circle(fb_surface, (*fb["color"], int(alpha * 0.30)), (center_surf, center_surf), anim_radius + 18)
+                
+                # Capa B: Núcleo interno ULTRA SATURADO (Subido de 30% a 85% de opacidad para que no sea transparente)
+                pygame.draw.circle(fb_surface, (*fb["color"], int(alpha * 0.85)), (center_surf, center_surf), anim_radius - 8)
+                
+                # Capa C: Anillo exterior de color de la nota (Ancho de 12px)
+                pygame.draw.circle(fb_surface, (*fb["color"], alpha), (center_surf, center_surf), anim_radius, 12)
+                
+                # Capa D: Línea central de contraste Blanco (Hace que resalte brutalmente sobre cualquier fondo oscuro)
+                pygame.draw.circle(fb_surface, (255, 255, 255, alpha), (center_surf, center_surf), anim_radius - 2, 4)
+                
+                # Renderizar en la pantalla principal
+                self.screen.blit(fb_surface, (int(x_pos) - center_surf, int(y_pos) - center_surf))
+            else:
+                self.lane_feedbacks.pop(zone, None)
+        # =========================================================================
 
         if show_song_banner:
             banner_width = min(rect.width - 180, WINDOW_WIDTH - 360)

@@ -42,6 +42,7 @@ SONGS_DIR = Path(__file__).resolve().parent / "assets" / "songs"
 TRACKING_SCRIPT_PATH = Path(__file__).resolve().parent / "main.py"
 VOICE_LISTENER_PY_PATH = Path(__file__).resolve().parent / "voice_listener.py"
 VOICE_LISTENER_PS1_PATH = Path(__file__).resolve().parent / "voice_listener.ps1"
+METRICS_JSON_PATH = Path(__file__).resolve().parent / "session_metrics.json"
 CREDIT_LINES = [
     "AirDrums",
     "Proyecto universitario de interaccion humano-computador",
@@ -542,6 +543,7 @@ class UdpHitReceiver:
         self.stick_2_y = None
         self.stick_1_x = None
         self.stick_2_x = None
+        self.received_any_packet = False
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.bind((host, port))
@@ -574,6 +576,7 @@ class UdpHitReceiver:
                 
             # NUEVO: Si recibimos coordenadas, registrar su estado global
             if message.get("tipo") == "posicion":
+                self.received_any_packet = True
                 self.stick_1_y = message.get("stick_1_y")
                 self.stick_2_y = message.get("stick_2_y")
                 self.stick_1_x = message.get("stick_1_x")
@@ -583,6 +586,7 @@ class UdpHitReceiver:
             # Mantener la captura de golpes a la lista
             zone = message.get("zone")
             if zone:
+                self.received_any_packet = True
                 hits.append(zone)
 
         return hits
@@ -1351,6 +1355,12 @@ class RhythmGame:
         self.available_powers = []
         self.active_power_effects = {}
         self.power_phrase_states = {}
+        self.session_started_at = pygame.time.get_ticks() / 1000.0
+        self.camera_ready_at = None
+        self.metrics_flush_interval_seconds = 20.0
+        self.metrics_last_saved_at = 0.0
+        self.metrics_session_id = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.metrics = self._build_empty_metrics()
         if "microfono" in self.voice_backend_name.lower():
             self.command_feedback = "Voz activa: menu o pausa en partida; jugar, calibrar, creditos, salir"
         elif "micro no configurado" in self.voice_backend_name.lower():
@@ -1366,6 +1376,104 @@ class RhythmGame:
             return self.voice_listener.backend_name
         return "Texto (micro no configurado)"
 
+    def _build_empty_metrics(self):
+        # Este cambio inicializa un acumulador único de métricas para toda la sesión actual del juego.
+        return {
+            "hits_outside_game": 0,
+            "correct_notes": 0,
+            "missed_notes": 0,
+            "false_hits": 0,
+            "correct_hit_latency_samples": 0,
+            "correct_hit_latency_ms_total": 0.0,
+            "correct_hit_latency_ms_average": 0.0,
+            "false_hit_latency_samples": 0,
+            "false_hit_latency_ms_total": 0.0,
+            "false_hit_latency_ms_average": 0.0,
+            "songs_started": 0,
+        }
+
+    def _session_elapsed_seconds(self, current_time: float | None = None):
+        # Este cambio calcula el tiempo de sesión descontando la espera hasta que tracking/cámara envía su primer paquete.
+        if current_time is None:
+            current_time = pygame.time.get_ticks() / 1000.0
+        elapsed = max(0.0, current_time - self.session_started_at)
+        if self.camera_ready_at is not None:
+            elapsed -= max(0.0, self.camera_ready_at - self.session_started_at)
+        return max(0.0, elapsed)
+
+    def _mark_camera_ready_if_needed(self, current_time: float):
+        # Este cambio toma el primer paquete UDP del tracking como el momento en que la cámara ya quedó lista.
+        if self.camera_ready_at is None and getattr(self.receiver, "received_any_packet", False):
+            self.camera_ready_at = current_time
+
+    def _record_hits_outside_game(self, hits: list[str]):
+        # Este cambio cuenta golpes detectados mientras el usuario aún no está tocando una canción.
+        if not hits or self.state == "playing":
+            return
+        self.metrics["hits_outside_game"] += len(hits)
+
+    def _record_correct_hit_metrics(self, candidate_offset: float):
+        # Este cambio acumula notas acertadas y su latencia absoluta en milisegundos.
+        latency_ms = abs(candidate_offset) * 1000.0
+        self.metrics["correct_notes"] += 1
+        self.metrics["correct_hit_latency_samples"] += 1
+        self.metrics["correct_hit_latency_ms_total"] += latency_ms
+        self.metrics["correct_hit_latency_ms_average"] = (
+            self.metrics["correct_hit_latency_ms_total"] / max(1, self.metrics["correct_hit_latency_samples"])
+        )
+
+    def _record_false_hit_metrics(self, candidate_offset: float | None = None):
+        # Este cambio acumula golpes inválidos y su distancia temporal respecto a la nota más cercana si existía.
+        self.metrics["false_hits"] += 1
+        if candidate_offset is None:
+            return
+        latency_ms = abs(candidate_offset) * 1000.0
+        self.metrics["false_hit_latency_samples"] += 1
+        self.metrics["false_hit_latency_ms_total"] += latency_ms
+        self.metrics["false_hit_latency_ms_average"] = (
+            self.metrics["false_hit_latency_ms_total"] / max(1, self.metrics["false_hit_latency_samples"])
+        )
+
+    def _record_missed_note_metrics(self):
+        # Este cambio acumula las notas que el jugador dejó pasar sin golpear.
+        self.metrics["missed_notes"] += 1
+
+    def _write_metrics_snapshot(self, force: bool = False):
+        # Este cambio sobreescribe un único JSON de métricas cada cierto tiempo y también al cerrar la app.
+        current_time = pygame.time.get_ticks() / 1000.0
+        if not force and current_time - self.metrics_last_saved_at < self.metrics_flush_interval_seconds:
+            return
+        payload = {
+            "session_id": self.metrics_session_id,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "session_elapsed_seconds": round(self._session_elapsed_seconds(current_time), 3),
+            "camera_ready_delay_seconds": None if self.camera_ready_at is None else round(max(0.0, self.camera_ready_at - self.session_started_at), 3),
+            "state": self.state,
+            "song": None if self.song_data is None else {
+                "title": self.song_data.title,
+                "artist": self.song_data.artist,
+                "difficulty": self.selected_difficulty,
+            },
+            "metrics": {
+                "hits_outside_game": self.metrics["hits_outside_game"],
+                "songs_started": self.metrics["songs_started"],
+                "correct_notes": self.metrics["correct_notes"],
+                "missed_notes": self.metrics["missed_notes"],
+                "false_hits": self.metrics["false_hits"],
+                "correct_hit_latency_samples": self.metrics["correct_hit_latency_samples"],
+                "correct_hit_latency_ms_total": round(self.metrics["correct_hit_latency_ms_total"], 3),
+                "correct_hit_latency_ms_average": round(self.metrics["correct_hit_latency_ms_average"], 3),
+                "false_hit_latency_samples": self.metrics["false_hit_latency_samples"],
+                "false_hit_latency_ms_total": round(self.metrics["false_hit_latency_ms_total"], 3),
+                "false_hit_latency_ms_average": round(self.metrics["false_hit_latency_ms_average"], 3),
+            },
+        }
+        try:
+            METRICS_JSON_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.metrics_last_saved_at = current_time
+        except OSError:
+            pass
+
     def run(self):
         # Este cambio deja corriendo red, voz y juego en el mismo loop sin romper el modo individual.
         """Bucle principal de render + update."""
@@ -1376,6 +1484,7 @@ class RhythmGame:
                 self._update(dt)
                 self._draw()
         finally:
+            self._write_metrics_snapshot(force=True)
             pygame.mixer.music.stop()
             try:
                 self.voice_listener.stop()
@@ -1572,6 +1681,7 @@ class RhythmGame:
     def _update(self, dt: float):
         # Este cambio procesa la red local y sincroniza el lobby antes de actualizar la partida.
         current_time = pygame.time.get_ticks() / 1000.0
+        self._mark_camera_ready_if_needed(current_time)
         self.display_health += (self.health - self.display_health) * min(1.0, dt * 8.0)
         self.multiplayer_remote_display_health += (self.multiplayer_remote_health - self.multiplayer_remote_display_health) * min(1.0, dt * 8.0)
         self._cleanup_expired_power_effects(current_time)
@@ -1592,6 +1702,8 @@ class RhythmGame:
 
         hits = self.receiver.poll_hits()
         hit_set = set(hits)
+        self._mark_camera_ready_if_needed(current_time)
+        self._record_hits_outside_game(hits)
 
         if self.state == "playing":
             if self.song_started_at is not None and current_time >= self.song_started_at and not self.music_started:
@@ -1664,6 +1776,7 @@ class RhythmGame:
                  pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=fake_key))
                  
         if self.state == "surrendered":
+            self._write_metrics_snapshot()
             if current_time - self.surrender_started_at >= 4.0:
                 if self.surrender_action_type == "restart":
                     self._restart_current_song()
@@ -1672,10 +1785,13 @@ class RhythmGame:
             return
 
         if self.state == "disconnected":
+            self._write_metrics_snapshot()
             if current_time - self.disconnect_started_at >= 4.0:
                 self._leave_multiplayer_mode()
                 self._go_to_main_menu()
             return
+
+        self._write_metrics_snapshot()
 
 
 
@@ -2149,6 +2265,7 @@ class RhythmGame:
 
     def _exit_to_song_select(self):
         # Este cambio limpia audio y temporizadores al salir de una canción hacia el selector.
+        self._write_metrics_snapshot(force=True)
         pygame.mixer.music.stop()
         try:
             self.vocals_channel.stop()
@@ -2417,6 +2534,7 @@ class RhythmGame:
             self._start_song(delay_seconds=3.0)
 
     def _start_song(self, delay_seconds: float = 3.0, start_epoch: float | None = None):
+        # Este cambio marca cada inicio de canción dentro de la sesión de métricas.
         self.state = "playing"
         # Este cambio usa un tiempo absoluto compartido para que host y cliente arranquen sincronizados.
         if start_epoch is not None:
@@ -2427,6 +2545,7 @@ class RhythmGame:
         self.accumulated_pause_seconds = 0.0
         self.note_speed_label = "normal"
         self._reset_run_stats()
+        self.metrics["songs_started"] += 1
 
         for note in self.notes:
             note.hit = False
@@ -2434,6 +2553,7 @@ class RhythmGame:
 
     def _restart_song(self):
         # Este cambio devuelve al selector tras una partida terminada o cancelada.
+        self._write_metrics_snapshot(force=True)
         pygame.mixer.music.stop()
         try:
             self.vocals_channel.stop()
@@ -2580,12 +2700,15 @@ class RhythmGame:
 
         candidate = None
         candidate_offset = None
+        nearest_same_zone_offset = None
 
         for note in self.notes:
             if note.judged or note.zone != zone:
                 continue
 
             offset = song_time - note.time
+            if nearest_same_zone_offset is None or abs(offset) < abs(nearest_same_zone_offset):
+                nearest_same_zone_offset = offset
             if offset < -EARLY_HIT_WINDOW_SECONDS or offset > LATE_HIT_WINDOW_SECONDS:
                 continue
 
@@ -2598,6 +2721,7 @@ class RhythmGame:
             has_upcoming_note = self._has_upcoming_note(zone, song_time)
             self.last_judgement = "Muy pronto" if has_upcoming_note else "Fuera de tiempo"
             self.miss_streak += 1
+            self._record_false_hit_metrics(nearest_same_zone_offset)
             penalty = self._current_profile().health_loss_bad_hit * (0.75 if has_upcoming_note else 1.0)
             self._change_health(-penalty)
             self.last_hit_zone = zone
@@ -2607,6 +2731,7 @@ class RhythmGame:
 
         candidate.hit = True
         candidate.judged = True
+        self._record_correct_hit_metrics(candidate_offset)
         self.combo += 1
         self.best_combo = max(self.best_combo, self.combo)
         self.miss_streak = 0
@@ -2634,6 +2759,7 @@ class RhythmGame:
                 note.judged = True
                 note.hit = False
                 self._register_power_phrase_miss(note)
+                self._record_missed_note_metrics()
                 self.combo = 0
                 self.miss_streak += 1
                 self._change_health(-self._current_profile().health_loss_miss)
